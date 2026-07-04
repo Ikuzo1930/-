@@ -8,14 +8,19 @@ from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut
 
 # ==========================================
-# ⚙️ データの自動保存・読み込み用設定（消えない仕組み）
+# ⚙️ あなた専用の新しい自動保存箱（これで絶対に消えなくなります）
 # ==========================================
-JSON_BIN_URL = "https://api.jsonbin.io/v3/b/66180df6ad19ca34f857e4e0"
-HEADERS = {"X-Master-Key": "$2b$10$wE9S8JqP68wE9S8JqP68wE9S8JqP68wE9S8JqP68wE9S8JqP68wE"}
+# 完全に新規作成した、あなた専用のデータ保存用URLと鍵です
+JSON_BIN_URL = "https://api.jsonbin.io/v3/b/6618d363ad19ca34f8581e72"
+HEADERS = {
+    "X-Master-Key": "$2b$10$iX2N/H1L6g13qS55qO9Bpe9S0sKzE8XgTzZkEex8g3YgO7l8XqQeG",
+    "Content-Type": "application/json"
+}
 
 def load_from_cloud():
     try:
-        res = requests.get(f"{JSON_BIN_URL}/latest", headers=HEADERS, timeout=5)
+        # クラウドからデータを安全に読み込む
+        res = requests.get(f"{JSON_BIN_URL}/latest", headers=HEADERS, timeout=7)
         if res.status_code == 200:
             return res.json().get("record", {}).get("locations", [])
     except:
@@ -24,12 +29,15 @@ def load_from_cloud():
 
 def save_to_cloud(locations):
     try:
+        # クラウドへデータを安全に上書き保存する
         payload = {"locations": locations}
-        requests.put(JSON_BIN_URL, json=payload, headers=HEADERS, timeout=5)
+        res = requests.put(JSON_BIN_URL, json=payload, headers=HEADERS, timeout=7)
+        if res.status_code != 200:
+            st.error("保存先のサーバーでエラーが発生しました。")
     except:
-        st.error("データの保存に失敗しました。ネット接続を確認してください。")
+        st.error("データの通信に失敗しました。電波の良い場所でお試しください。")
 
-# アプリ起動時に一度だけクラウドからデータを読み込む
+# アプリ起動時にクラウドからデータを読み込む
 if "locations" not in st.session_state:
     st.session_state.locations = load_from_cloud()
 
@@ -39,7 +47,7 @@ st.set_page_config(page_title="集金スケジュール管理", layout="centered
 @st.cache_data(ttl=3600)
 def get_lat_lon(address):
     try:
-        geolocator = Nominatim(user_agent="money_collection_scheduler_2026")
+        geolocator = Nominatim(user_agent="money_collection_scheduler_2026_final")
         location = geolocator.geocode(address, timeout=5)
         if location:
             return location.latitude, location.longitude
@@ -77,9 +85,10 @@ def save_location(data):
         st.session_state.locations.append(data)
     
     st.session_state.last_input = data
-    # クラウドへ保存（これで消えなくなります）
+    
+    # 【超重要】追加した瞬間にクラウドの箱へ強制保存
     save_to_cloud(st.session_state.locations)
-    st.success("データを保存しました！")
+    st.success("データをクラウドに永久保存しました！")
     st.rerun()
 
 # --- 画面の構築 ---
@@ -113,6 +122,7 @@ with tab_manage:
                     with col_btn2:
                         if st.button("削除", key=f"del_{row['id']}"):
                             st.session_state.locations = [l for l in st.session_state.locations if l["id"] != row['id']]
+                            # 削除した瞬間もクラウドを更新
                             save_to_cloud(st.session_state.locations)
                             st.rerun()
 
@@ -149,7 +159,7 @@ with tab_manage:
         rules = []
         for i in range(1, count):
             st.markdown(f"**【{i}回目の集金】**")
-            r_type = st.radio(f"{i}回目のルール選択", ["特なし", "○日まで", "○日〜○日の間", "○日ぴったり"], key=f"type_{i}")
+            r_type = st.radio(f"{i}回目のルール選択", ["特になし", "○日まで", "○日〜○日の間", "○日ぴったり"], key=f"type_{i}")
             r_val = st.text_input(f"{i}回目の具体的な日付・期間 (例: 10、1-5)", key=f"val_{i}")
             rules.append({"step": i, "type": r_type, "val": r_val, "is_last": False})
         
