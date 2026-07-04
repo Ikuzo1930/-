@@ -8,9 +8,8 @@ from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut
 
 # ==========================================
-# ⚙️ あなた専用の新しい自動保存箱（これで絶対に消えなくなります）
+# ⚙️ クラウド自動保存設定（修正版）
 # ==========================================
-# 完全に新規作成した、あなた専用のデータ保存用URLと鍵です
 JSON_BIN_URL = "https://api.jsonbin.io/v3/b/6618d363ad19ca34f8581e72"
 HEADERS = {
     "X-Master-Key": "$2b$10$iX2N/H1L6g13qS55qO9Bpe9S0sKzE8XgTzZkEex8g3YgO7l8XqQeG",
@@ -19,7 +18,6 @@ HEADERS = {
 
 def load_from_cloud():
     try:
-        # クラウドからデータを安全に読み込む
         res = requests.get(f"{JSON_BIN_URL}/latest", headers=HEADERS, timeout=7)
         if res.status_code == 200:
             return res.json().get("record", {}).get("locations", [])
@@ -29,15 +27,17 @@ def load_from_cloud():
 
 def save_to_cloud(locations):
     try:
-        # クラウドへデータを安全に上書き保存する
+        # 箱のルールに完璧に合わせたデータ形式（修正ポイント）
         payload = {"locations": locations}
-        res = requests.put(JSON_BIN_URL, json=payload, headers=HEADERS, timeout=7)
-        if res.status_code != 200:
-            st.error("保存先のサーバーでエラーが発生しました。")
-    except:
-        st.error("データの通信に失敗しました。電波の良い場所でお試しください。")
+        res = requests.put(JSON_BIN_URL, data=json.dumps(payload), headers=HEADERS, timeout=7)
+        if res.status_code == 200:
+            st.success("☁️ データをクラウド保存箱に永久保存しました！もう閉じても消えません。")
+        else:
+            st.error(f"❌ 保存箱側ではじかれました (コード: {res.status_code})。中身: {res.text}")
+    except Exception as e:
+        st.error(f"❌ 通信エラーが発生しました: {str(e)}")
 
-# アプリ起動時にクラウドからデータを読み込む
+# アプリ起動時にデータを読み込む
 if "locations" not in st.session_state:
     st.session_state.locations = load_from_cloud()
 
@@ -47,7 +47,7 @@ st.set_page_config(page_title="集金スケジュール管理", layout="centered
 @st.cache_data(ttl=3600)
 def get_lat_lon(address):
     try:
-        geolocator = Nominatim(user_agent="money_collection_scheduler_2026_final")
+        geolocator = Nominatim(user_agent="money_collection_scheduler_2026_final_fix")
         location = geolocator.geocode(address, timeout=5)
         if location:
             return location.latitude, location.longitude
@@ -86,9 +86,8 @@ def save_location(data):
     
     st.session_state.last_input = data
     
-    # 【超重要】追加した瞬間にクラウドの箱へ強制保存
+    # 強制保存を実行
     save_to_cloud(st.session_state.locations)
-    st.success("データをクラウドに永久保存しました！")
     st.rerun()
 
 # --- 画面の構築 ---
@@ -122,7 +121,6 @@ with tab_manage:
                     with col_btn2:
                         if st.button("削除", key=f"del_{row['id']}"):
                             st.session_state.locations = [l for l in st.session_state.locations if l["id"] != row['id']]
-                            # 削除した瞬間もクラウドを更新
                             save_to_cloud(st.session_state.locations)
                             st.rerun()
 
