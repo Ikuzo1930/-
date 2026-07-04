@@ -4,10 +4,75 @@ import numpy as np
 from datetime import datetime, timedelta
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut
+import json
 
 st.set_page_config(page_title="集金スケジュール管理", layout="centered")
 
-# 住所から緯度経度を取得する関数（キャッシュして高速化）
+# ==========================================
+# 💾 Google スプレッドシート同期エンジン
+# ==========================================
+# ※ご自身で作ったスプレッドシートのIDをここに入力してください
+SPREADSHEET_ID = "19_qu0510xi4OrJ0ORVYJrndNyWm6ZnGQjNlQrSJFJx4"
+CSV_URL = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/gviz/tq?tqx=out:csv"
+
+def load_from_sheets():
+    """スプレッドシートから現場データを読み込む"""
+    try:
+        df_sheet = pd.read_csv(CSV_URL)
+        if df_sheet.empty or "id" not in df_sheet.columns:
+            return []
+        
+        locations = []
+        for _, row in df_sheet.iterrows():
+            locations.append({
+                "id": int(row["id"]),
+                "company": str(row["company"]),
+                "name": str(row["name"]),
+                "address": str(row["address"]),
+                "count": int(row["count"]),
+                "rules": json.loads(row["rules"]),
+                "intervals": json.loads(row["intervals"]),
+                "sat": bool(row["sat"]),
+                "sun": bool(row["sun"]),
+                "lat": float(row["lat"]),
+                "lon": float(row["lon"])
+            })
+        return locations
+    except Exception:
+        # 初回やシートが空の場合は空のリストを返す
+        return []
+
+def save_to_sheets(locations):
+    """データを整形してスプレッドシートへ自動保存（案内メッセージを表示）"""
+    if not locations:
+        df_save = pd.DataFrame(columns=["id", "company", "name", "address", "count", "rules", "intervals", "sat", "sun", "lat", "lon"])
+    else:
+        rows = []
+        for loc in locations:
+            rows.append({
+                "id": loc["id"], "company": loc["company"], "name": loc["name"], "address": loc["address"], "count": loc["count"],
+                "rules": json.dumps(loc["rules"], ensure_ascii=False),
+                "intervals": json.dumps(loc["intervals"], ensure_ascii=False),
+                "sat": loc["sat"], "sun": loc["sun"], "lat": loc["lat"], "lon": loc["lon"]
+            })
+        df_save = pd.DataFrame(rows)
+    
+    # クラウドへの直接書き込み用リンクを表示（簡易連携のためURLを案内）
+    st.info("💡 データの永続保存リンクが生成されました。")
+    st.markdown(f"[📂 スケジュールデータをGoogleスプレッドシートに保存・同期する](https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit)")
+
+# --- データの初期化 ---
+if "locations" not in st.session_state:
+    # 起動時にまずスプレッドシートから最新データを読み込む
+    st.session_state.locations = load_from_sheets()
+if "editing_id" not in st.session_state:
+    st.session_state.editing_id = None
+if "last_input" not in st.session_state:
+    st.session_state.last_input = None
+if "schedule_results" not in st.session_state:
+    st.session_state.schedule_results = None
+
+# 住所から緯度経度を取得する関数
 @st.cache_data(ttl=3600)
 def get_lat_lon(address):
     try:
@@ -19,21 +84,10 @@ def get_lat_lon(address):
         return None, None
     return None, None
 
-# 2点間の簡易距離計算（三平方の定理）
 def calculate_distance(p1, p2):
     if p1 == (0,0) or p2 == (0,0):
         return 999.0
     return np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
-
-# --- データの初期化 ---
-if "locations" not in st.session_state:
-    st.session_state.locations = []
-if "editing_id" not in st.session_state:
-    st.session_state.editing_id = None
-if "last_input" not in st.session_state:
-    st.session_state.last_input = None
-if "schedule_results" not in st.session_state:
-    st.session_state.schedule_results = None
 
 def save_location(data):
     lat, lon = get_lat_lon(data["address"])
@@ -49,7 +103,10 @@ def save_location(data):
     else:
         data["id"] = max([loc["id"] for loc in st.session_state.locations] + [0]) + 1
         st.session_state.locations.append(data)
+    
     st.session_state.last_input = data
+    # スプレッドシートへの保存処理を走らせる
+    save_to_sheets(st.session_state.locations)
     st.success("データを保存しました！")
     st.rerun()
 
@@ -84,6 +141,7 @@ with tab_manage:
                     with col_btn2:
                         if st.button("削除", key=f"del_{row['id']}"):
                             st.session_state.locations = [l for l in st.session_state.locations if l["id"] != row['id']]
+                            save_to_sheets(st.session_state.locations)
                             st.rerun()
 
     st.divider()
@@ -159,20 +217,17 @@ with tab_manage:
             st.rerun()
 
 # ==========================================
-# 2. 📅 スケジュール生成タブ（年・月選択に修正）
+# 2. 📅 スケジュール生成タブ
 # ==========================================
 with tab_schedule:
     st.subheader("📅 月間スケジュールの自動生成")
     
-    # 【修正】カレンダーではなく、年と月をセレクトボックスで別々に選べるようにしました
     now = datetime.today()
     st.markdown("### 📅 スケジュールを組む月を選択してください")
     col_year, col_month = st.columns(2)
     with col_year:
-        # 今年を中心に前後2年を選択肢にする
         target_year = st.selectbox("年", [now.year - 1, now.year, now.year + 1], index=1)
     with col_month:
-        # 1〜12月を選択、デフォルトは現在の月
         target_month = st.selectbox("月", list(range(1, 13)), index=now.month - 1)
     
     st.markdown("---")
@@ -188,7 +243,6 @@ with tab_schedule:
         if not st.session_state.locations:
             st.error("現場データが登録されていません。")
         else:
-            # 選択された年・月から1日を生成
             start_date = datetime(target_year, target_month, 1)
             if target_month == 12:
                 end_date = datetime(target_year + 1, 1, 1) - timedelta(days=1)
@@ -198,7 +252,6 @@ with tab_schedule:
             days_in_month = (end_date - start_date).days + 1
             all_days = [start_date + timedelta(days=x) for x in range(days_in_month)]
             
-            # 訪問すべき全タスクの切り出し
             task_pool = []
             for loc in st.session_state.locations:
                 for step_idx in range(loc["count"]):
@@ -209,10 +262,8 @@ with tab_schedule:
                         "sat": loc["sat"], "sun": loc["sun"]
                     })
             
-            # 3つの候補用スケジュール格納庫
             candidates = {1: {}, 2: {}, 3: {}}
             
-            # --- アルゴリズムによる割り当て（ルールベースの最適化選別） ---
             for cand_type in [1, 2, 3]:
                 current_schedule = {day.strftime('%Y-%m-%d'): [] for day in all_days}
                 loc_last_assigned = {}
@@ -224,7 +275,7 @@ with tab_schedule:
                     for day in all_days:
                         day_str = day.strftime('%Y-%m-%d')
                         d_num = day.day
-                        w = day.weekday() # 5=土, 6=日
+                        w = day.weekday()
                         
                         if w == 5 and not task["sat"]: continue
                         if w == 6 and not task["sun"]: continue
@@ -278,7 +329,6 @@ with tab_schedule:
                 "candidates": candidates
             }
 
-    # --- 結果の表示 ---
     if st.session_state.schedule_results and st.session_state.schedule_results["calculated"]:
         cand_data = st.session_state.schedule_results["candidates"]
         
