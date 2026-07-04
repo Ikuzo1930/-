@@ -8,7 +8,7 @@ from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut
 
 # ==========================================
-# ⚙️ クラウド自動保存設定（修正版）
+# ⚙️ クラウド自動保存設定（診断機能付き）
 # ==========================================
 JSON_BIN_URL = "https://api.jsonbin.io/v3/b/6618d363ad19ca34f8581e72"
 HEADERS = {
@@ -21,21 +21,24 @@ def load_from_cloud():
         res = requests.get(f"{JSON_BIN_URL}/latest", headers=HEADERS, timeout=7)
         if res.status_code == 200:
             return res.json().get("record", {}).get("locations", [])
-    except:
-        pass
+        else:
+            st.warning(f"⚠️ 起動時のデータ読み込みに失敗しました (ステータス: {res.status_code})")
+    except Exception as e:
+        st.warning(f"⚠️ 読み込み時の通信エラー: {str(e)}")
     return []
 
 def save_to_cloud(locations):
     try:
-        # 箱のルールに完璧に合わせたデータ形式（修正ポイント）
         payload = {"locations": locations}
+        # JSON文字列にきっちり変換して送信
         res = requests.put(JSON_BIN_URL, data=json.dumps(payload), headers=HEADERS, timeout=7)
         if res.status_code == 200:
-            st.success("☁️ データをクラウド保存箱に永久保存しました！もう閉じても消えません。")
+            st.success("☁️ サーバーへの保存リクエストが成功しました！")
         else:
-            st.error(f"❌ 保存箱側ではじかれました (コード: {res.status_code})。中身: {res.text}")
+            st.error(f"❌ サーバーが保存を拒否しました (エラーコード: {res.status_code})")
+            st.code(res.text) # 原因を画面に出力
     except Exception as e:
-        st.error(f"❌ 通信エラーが発生しました: {str(e)}")
+        st.error(f"❌ 通信そのものに失敗しました: {str(e)}")
 
 # アプリ起動時にデータを読み込む
 if "locations" not in st.session_state:
@@ -43,11 +46,18 @@ if "locations" not in st.session_state:
 
 st.set_page_config(page_title="集金スケジュール管理", layout="centered")
 
+# アプリの状態を画面最上部にデバッグ表示
+st.write("--- 🔍 現在のアプリの記憶状態 ---")
+st.write(f"現在アプリが覚えている現場数: {len(st.session_state.locations)}件")
+if st.session_state.locations:
+    st.json(st.session_state.locations)
+st.write("---------------------------------")
+
 # 住所から緯度経度を取得する関数
 @st.cache_data(ttl=3600)
 def get_lat_lon(address):
     try:
-        geolocator = Nominatim(user_agent="money_collection_scheduler_2026_final_fix")
+        geolocator = Nominatim(user_agent="money_collection_scheduler_2026_ultimate_debug")
         location = geolocator.geocode(address, timeout=5)
         if location:
             return location.latitude, location.longitude
@@ -86,7 +96,7 @@ def save_location(data):
     
     st.session_state.last_input = data
     
-    # 強制保存を実行
+    # クラウド保存を実行
     save_to_cloud(st.session_state.locations)
     st.rerun()
 
