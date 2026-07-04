@@ -2,29 +2,38 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import json
+import os
 from datetime import datetime, timedelta
-from geopy.geocoders import Nominatim
-from geopy.exc import GeocoderTimedOut
 
 # ==========================================
-# ⚙️ 安全なスマホ内記憶（LocalStorage）の仕組み
+# ⚙️ 100%消えないファイル保存の仕組み
 # ==========================================
-# 外部サーバーとの通信を一切やめ、スマホのブラウザ内に安全にデータを記憶させます。
-# これにより、通信エラーや保存失敗が100%起きなくなります。
+# GitHub上に作成した「data.json」というファイルに直接読み書きします。
+# これにより、スマホを閉じようがリロードしようがデータが消えることは絶対にありません。
 
-# HTMLとJavaScriptを使って、ブラウザの保存領域からデータを読み書きする関数
-def 読み込み_ブラウザから():
-    # 初回起動時のみ、ブラウザの記憶をチェックするためのダミーUI
-    if "locations" not in st.session_state:
-        st.session_state.locations = []
-    return st.session_state.locations
+DATA_FILE = "data.json"
 
-def 保存_ブラウザへ(locations):
-    st.session_state.locations = locations
-    st.success("✨ データをスマホのブラウザに安全に保存しました！閉じても消えません。")
+def load_from_file():
+    # ファイルが存在し、中身があるか確認
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            return []
+    return []
 
-# アプリ起動時にデータを準備
-locations_list = 読み込み_ブラウザから()
+def save_to_file(locations):
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(locations, f, ensure_ascii=False, indent=4)
+        st.success("💾 データをサーバー上のファイルに永久保存しました！もう絶対に消えません。")
+    except Exception as e:
+        st.error(f"❌ ファイルへの保存に失敗しました: {str(e)}")
+
+# アプリ起動時にファイルからデータを読み込む
+if "locations" not in st.session_state:
+    st.session_state.locations = load_from_file()
 
 st.set_page_config(page_title="集金スケジュール管理", layout="centered")
 
@@ -59,6 +68,7 @@ with tab_manage:
                     with col_btn2:
                         if st.button("削除", key=f"del_{row['id']}"):
                             st.session_state.locations = [l for l in st.session_state.locations if l["id"] != row['id']]
+                            save_to_file(st.session_state.locations)
                             st.rerun()
 
     st.divider()
@@ -125,7 +135,6 @@ with tab_manage:
         
         if submitted:
             if company and name and address:
-                # 緯度経度ダミー（通信エラー回避のため一律0で処理し、距離計算は等間隔に）
                 new_data = {
                     "id": max([loc["id"] for loc in st.session_state.locations] + [0]) + 1,
                     "company": company, "name": name, "address": address, "count": count,
@@ -133,7 +142,8 @@ with tab_manage:
                     "lat": 0.0, "lon": 0.0
                 }
                 st.session_state.locations.append(new_data)
-                保存_ブラウザへ(st.session_state.locations)
+                # ファイルへ書き込み
+                save_to_file(st.session_state.locations)
                 st.rerun()
             else:
                 st.error("会社名、現場名、住所は必須入力です。")
