@@ -6,15 +6,11 @@ import os
 from datetime import datetime, timedelta
 
 # ==========================================
-# ⚙️ 100%消えないファイル保存の仕組み
+# ⚙️ データファイル保存設定（バグ修正版）
 # ==========================================
-# GitHub上に作成した「data.json」というファイルに直接読み書きします。
-# これにより、スマホを閉じようがリロードしようがデータが消えることは絶対にありません。
-
 DATA_FILE = "data.json"
 
 def load_from_file():
-    # ファイルが存在し、中身があるか確認
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -27,7 +23,6 @@ def save_to_file(locations):
     try:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(locations, f, ensure_ascii=False, indent=4)
-        st.success("💾 データをサーバー上のファイルに永久保存しました！もう絶対に消えません。")
     except Exception as e:
         st.error(f"❌ ファイルへの保存に失敗しました: {str(e)}")
 
@@ -35,9 +30,13 @@ def save_to_file(locations):
 if "locations" not in st.session_state:
     st.session_state.locations = load_from_file()
 
+# 状態の初期化
+if "editing_id" not in st.session_state: st.session_state.editing_id = None
+if "last_input" not in st.session_state: st.session_state.last_input = None
+if "schedule_results" not in st.session_state: st.session_state.schedule_results = None
+
 st.set_page_config(page_title="集金スケジュール管理", layout="centered")
 
-# --- 画面の構築 ---
 st.title("💰 集金スケジュール管理")
 
 tab_manage, tab_schedule = st.tabs(["📋 現場管理", "📅 スケジュール生成"])
@@ -67,34 +66,37 @@ with tab_manage:
                             st.rerun()
                     with col_btn2:
                         if st.button("削除", key=f"del_{row['id']}"):
+                            # 削除された現場が編集中のものなら、編集状態を安全に解除（エラー対策）
+                            if st.session_state.editing_id == row['id']:
+                                st.session_state.editing_id = None
+                            
                             st.session_state.locations = [l for l in st.session_state.locations if l["id"] != row['id']]
                             save_to_file(st.session_state.locations)
+                            st.success("現場を削除しました。")
                             st.rerun()
 
     st.divider()
     
-    if "editing_id" not in st.session_state: st.session_state.editing_id = None
-    if "last_input" not in st.session_state: st.session_state.last_input = None
-    if "schedule_results" not in st.session_state: st.session_state.schedule_results = None
-
+    # --- 編集フォームの取得処理 ---
+    current_data = None
     if st.session_state.editing_id is not None:
-        st.subheader("📝 現場の条件を編集")
-        current_data = next(l for l in st.session_state.locations if l["id"] == st.session_state.editing_id)
-    else:
+        # 安全にデータを検索し、万が一見つからない場合は編集状態を解除する（StopIteration対策）
+        found = [l for l in st.session_state.locations if l["id"] == st.session_state.editing_id]
+        if found:
+            st.subheader("📝 現場の条件を編集")
+            current_data = found[0]
+        else:
+            st.session_state.editing_id = None
+
+    if current_data is None:
         st.subheader("➕ 新しい現場を追加")
-        current_data = None
+        if st.session_state.last_input is not None:
+            if st.button("⏮️ 直前に登録した現場の条件をコピーする"):
+                current_data = st.session_state.last_input.copy()
+                current_data["name"] = "" 
+                current_data["address"] = ""
 
-    if current_data is None and st.session_state.last_input is not None:
-        if st.button("⏮️ 直前に登録した現場の条件をコピーする"):
-            current_data = st.session_state.last_input.copy()
-            current_data["name"] = "" 
-            current_data["address"] = ""
-
-    if current_data:
-        default_count = current_data["count"]
-    else:
-        default_count = 1
-        
+    default_count = current_data["count"] if current_data else 1
     count = st.selectbox("🔄 月に行く合計回数を選んでください", list(range(1, 11)), index=(default_count-1))
 
     with st.form("location_form", clear_on_submit=False):
@@ -135,18 +137,36 @@ with tab_manage:
         
         if submitted:
             if company and name and address:
-                new_data = {
-                    "id": max([loc["id"] for loc in st.session_state.locations] + [0]) + 1,
+                form_data = {
                     "company": company, "name": name, "address": address, "count": count,
                     "rules": rules, "intervals": intervals, "sat": sat, "sun": sun,
                     "lat": 0.0, "lon": 0.0
                 }
-                st.session_state.locations.append(new_data)
-                # ファイルへ書き込み
+                
+                # 【バグ修正】編集モードなら上書き、新規なら追加するロジック
+                if st.session_state.editing_id is not None:
+                    form_data["id"] = st.session_state.editing_id
+                    for idx, loc in enumerate(st.session_state.locations):
+                        if loc["id"] == st.session_state.editing_id:
+                            st.session_state.locations[idx] = form_data
+                            break
+                    st.session_state.editing_id = None
+                    st.success("✨ 現場の情報を更新（上書き）しました！")
+                else:
+                    form_data["id"] = max([loc["id"] for loc in st.session_state.locations] + [0]) + 1
+                    st.session_state.locations.append(form_data)
+                    st.success("💾 新しい現場を登録しました！")
+                
+                st.session_state.last_input = form_data
                 save_to_file(st.session_state.locations)
                 st.rerun()
             else:
                 st.error("会社名、現場名、住所は必須入力です。")
+                
+    if st.session_state.editing_id is not None:
+        if st.button("編集をキャンセル"):
+            st.session_state.editing_id = None
+            st.rerun()
 
 # ==========================================
 # 2. 📅 スケジュール生成タブ
@@ -169,11 +189,11 @@ with tab_schedule:
         min_tasks = st.selectbox("最小件数", list(range(1, 11)), index=1)
     with col_max:
         max_tasks = st.selectbox("最大件数", list(range(1, 12)), index=4)
-    st.markdown("---")
+    st.divider()
     
-    if st.button("🚀 現在の現場データでスケジュールを自動計算する", type="primary"):
+    if st.button("🚀 登録済みデータからスケジュールを自動生成する", type="primary"):
         if not st.session_state.locations:
-            st.error("現場データが登録されていません。")
+            st.error("現場データが登録されていません。一覧に登録されているデータが必要です。")
         else:
             start_date = datetime(target_year, target_month, 1)
             if target_month == 12:
@@ -204,7 +224,7 @@ with tab_schedule:
             st.session_state.schedule_results = {"calculated": True, "schedule": current_schedule}
 
     if st.session_state.schedule_results and st.session_state.schedule_results["calculated"]:
-        st.success("🗓️ スケジュールを生成しました！")
+        st.success("🗓️ スケジュールの生成に成功しました！「登録済み一覧」がバッチリ反映されています。")
         for day_str, tasks in st.session_state.schedule_results["schedule"].items():
             if tasks:
                 st.markdown(f"#### 📅 {day_str}")
