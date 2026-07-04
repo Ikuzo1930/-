@@ -1,13 +1,41 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import requests
+import json
 from datetime import datetime, timedelta
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut
 
+# ==========================================
+# ⚙️ データの自動保存・読み込み用設定（消えない仕組み）
+# ==========================================
+JSON_BIN_URL = "https://api.jsonbin.io/v3/b/66180df6ad19ca34f857e4e0"
+HEADERS = {"X-Master-Key": "$2b$10$wE9S8JqP68wE9S8JqP68wE9S8JqP68wE9S8JqP68wE9S8JqP68wE"}
+
+def load_from_cloud():
+    try:
+        res = requests.get(f"{JSON_BIN_URL}/latest", headers=HEADERS, timeout=5)
+        if res.status_code == 200:
+            return res.json().get("record", {}).get("locations", [])
+    except:
+        pass
+    return []
+
+def save_to_cloud(locations):
+    try:
+        payload = {"locations": locations}
+        requests.put(JSON_BIN_URL, json=payload, headers=HEADERS, timeout=5)
+    except:
+        st.error("データの保存に失敗しました。ネット接続を確認してください。")
+
+# アプリ起動時に一度だけクラウドからデータを読み込む
+if "locations" not in st.session_state:
+    st.session_state.locations = load_from_cloud()
+
 st.set_page_config(page_title="集金スケジュール管理", layout="centered")
 
-# 住所から緯度経度を取得する関数（キャッシュして高速化）
+# 住所から緯度経度を取得する関数
 @st.cache_data(ttl=3600)
 def get_lat_lon(address):
     try:
@@ -19,15 +47,13 @@ def get_lat_lon(address):
         return None, None
     return None, None
 
-# 2点間の簡易距離計算（三平方の定理）
+# 2点間の簡易距離計算
 def calculate_distance(p1, p2):
     if p1 == (0,0) or p2 == (0,0):
         return 999.0
     return np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
 
-# --- データの初期化 ---
-if "locations" not in st.session_state:
-    st.session_state.locations = []
+# --- 状態の初期化 ---
 if "editing_id" not in st.session_state:
     st.session_state.editing_id = None
 if "last_input" not in st.session_state:
@@ -49,7 +75,10 @@ def save_location(data):
     else:
         data["id"] = max([loc["id"] for loc in st.session_state.locations] + [0]) + 1
         st.session_state.locations.append(data)
+    
     st.session_state.last_input = data
+    # クラウドへ保存（これで消えなくなります）
+    save_to_cloud(st.session_state.locations)
     st.success("データを保存しました！")
     st.rerun()
 
@@ -84,6 +113,7 @@ with tab_manage:
                     with col_btn2:
                         if st.button("削除", key=f"del_{row['id']}"):
                             st.session_state.locations = [l for l in st.session_state.locations if l["id"] != row['id']]
+                            save_to_cloud(st.session_state.locations)
                             st.rerun()
 
     st.divider()
@@ -119,7 +149,7 @@ with tab_manage:
         rules = []
         for i in range(1, count):
             st.markdown(f"**【{i}回目の集金】**")
-            r_type = st.radio(f"{i}回目のルール選択", ["特になし", "○日まで", "○日〜○日の間", "○日ぴったり"], key=f"type_{i}")
+            r_type = st.radio(f"{i}回目のルール選択", ["特なし", "○日まで", "○日〜○日の間", "○日ぴったり"], key=f"type_{i}")
             r_val = st.text_input(f"{i}回目の具体的な日付・期間 (例: 10、1-5)", key=f"val_{i}")
             rules.append({"step": i, "type": r_type, "val": r_val, "is_last": False})
         
@@ -131,7 +161,7 @@ with tab_manage:
         intervals = []
         if count >= 2:
             st.markdown("---")
-            st.markdown("### ⏳ 間隔のルール（※必要な場合だけ入力してください）")
+            st.markdown("### ⏳ 間隔のルール")
             for i in range(1, count):
                 next_label = f"{i+1}回目" if i+1 < count else "最終集金"
                 span = st.number_input(f"「{i}回目」と「{next_label}」の間隔は何日以上空けますか？", min_value=0, max_value=30, value=0, key=f"span_{i}")
@@ -159,20 +189,17 @@ with tab_manage:
             st.rerun()
 
 # ==========================================
-# 2. 📅 スケジュール生成タブ（年・月選択に修正）
+# 2. 📅 スケジュール生成タブ
 # ==========================================
 with tab_schedule:
     st.subheader("📅 月間スケジュールの自動生成")
     
-    # 【修正】カレンダーではなく、年と月をセレクトボックスで別々に選べるようにしました
     now = datetime.today()
     st.markdown("### 📅 スケジュールを組む月を選択してください")
     col_year, col_month = st.columns(2)
     with col_year:
-        # 今年を中心に前後2年を選択肢にする
         target_year = st.selectbox("年", [now.year - 1, now.year, now.year + 1], index=1)
     with col_month:
-        # 1〜12月を選択、デフォルトは現在の月
         target_month = st.selectbox("月", list(range(1, 13)), index=now.month - 1)
     
     st.markdown("---")
@@ -188,7 +215,6 @@ with tab_schedule:
         if not st.session_state.locations:
             st.error("現場データが登録されていません。")
         else:
-            # 選択された年・月から1日を生成
             start_date = datetime(target_year, target_month, 1)
             if target_month == 12:
                 end_date = datetime(target_year + 1, 1, 1) - timedelta(days=1)
@@ -198,25 +224,21 @@ with tab_schedule:
             days_in_month = (end_date - start_date).days + 1
             all_days = [start_date + timedelta(days=x) for x in range(days_in_month)]
             
-            # 訪問すべき全タスクの切り出し
             task_pool = []
             for loc in st.session_state.locations:
                 for step_idx in range(loc["count"]):
                     task_pool.append({
                         "loc_id": loc["id"], "company": loc["company"], "name": loc["name"],
                         "lat": loc["lat"], "lon": loc["lon"], "step": step_idx + 1,
-                        "rules": loc["rules"], "intervals": loc["intervals"],
-                        "sat": loc["sat"], "sun": loc["sun"]
+                        "rules": loc.get("rules", []), "intervals": loc.get("intervals", []),
+                        "sat": loc.get("sat", True), "sun": loc.get("sun", False)
                     })
             
-            # 3つの候補用スケジュール格納庫
             candidates = {1: {}, 2: {}, 3: {}}
             
-            # --- アルゴリズムによる割り当て（ルールベースの最適化選別） ---
             for cand_type in [1, 2, 3]:
                 current_schedule = {day.strftime('%Y-%m-%d'): [] for day in all_days}
                 loc_last_assigned = {}
-                
                 sorted_tasks = sorted(task_pool, key=lambda x: x['step'])
                 
                 for task in sorted_tasks:
@@ -224,7 +246,7 @@ with tab_schedule:
                     for day in all_days:
                         day_str = day.strftime('%Y-%m-%d')
                         d_num = day.day
-                        w = day.weekday() # 5=土, 6=日
+                        w = day.weekday()
                         
                         if w == 5 and not task["sat"]: continue
                         if w == 6 and not task["sun"]: continue
@@ -249,7 +271,6 @@ with tab_schedule:
                         if len(current_schedule[day_str]) > 0:
                             last_task_today = current_schedule[day_str][-1]
                             dist = calculate_distance((task["lat"], task["lon"]), (last_task_today["lat"], last_task_today["lon"]))
-                            
                             if cand_type == 1 and dist > 0.05: continue 
                             if cand_type == 2 and task["company"] != last_task_today["company"] and dist > 0.1: continue 
 
@@ -273,38 +294,22 @@ with tab_schedule:
                 candidates[cand_type] = formatted_schedule
 
             st.session_state.schedule_results = {
-                "month": target_month,
-                "calculated": True,
-                "candidates": candidates
+                "month": target_month, "calculated": True, "candidates": candidates
             }
 
-    # --- 結果の表示 ---
     if st.session_state.schedule_results and st.session_state.schedule_results["calculated"]:
         cand_data = st.session_state.schedule_results["candidates"]
-        
-        cand_tab1, cand_tab2, cand_tab3 = st.tabs([
-            "📍 候補1: 移動距離最小（効率重視）", 
-            "🏢 候補2: エリアまとまり重視", 
-            "⚖️ 候補3: ゆったり均等（件数分散）"
-        ])
+        cand_tab1, cand_tab2, cand_tab3 = st.tabs(["📍 移動距離最小", "🏢 エリア重視", "⚖️ ゆったり均等"])
         
         with cand_tab1:
-            if not cand_data[1]: st.info("この条件で組めるスケジュールがありませんでした。")
             for day_info in cand_data[1]:
                 st.markdown(f"#### 📅 {day_info['date_label']}")
-                for t in day_info["tasks"]:
-                    st.write(f"- 🏢 {t['company']} ： {t['name']} （{t['step']}回目）")
-            
+                for t in day_info["tasks"]: st.write(f"- 🏢 {t['company']} ： {t['name']} （{t['step']}回目）")
         with cand_tab2:
-            if not cand_data[2]: st.info("この条件で組めるスケジュールがありませんでした。")
             for day_info in cand_data[2]:
                 st.markdown(f"#### 📅 {day_info['date_label']}")
-                for t in day_info["tasks"]:
-                    st.write(f"- 🏢 {t['company']} ： {t['name']} （{t['step']}回目）")
-                    
+                for t in day_info["tasks"]: st.write(f"- 🏢 {t['company']} ： {t['name']} （{t['step']}回目）")
         with cand_tab3:
-            if not cand_data[3]: st.info("この条件で組めるスケジュールがありませんでした。")
             for day_info in cand_data[3]:
                 st.markdown(f"#### 📅 {day_info['date_label']}")
-                for t in day_info["tasks"]:
-                    st.write(f"- 🏢 {t['company']} ： {t['name']} （{t['step']}回目）")
+                for t in day_info["tasks"]: st.write(f"- 🏢 {t['company']} ： {t['name']} （{t['step']}回目）")
