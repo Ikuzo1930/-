@@ -1,55 +1,178 @@
+"""
+改良版 Streamlit アプリ
+- ルール種別を内部キーに正規化
+- save_data を原子的に置換
+- get_lat_lon_ai にキャッシュ
+- UNK_DISTANCE を定義
+"""
 import streamlit as st
 import pandas as pd
 import numpy as np
 import json
 import os
+import logging
 from datetime import datetime, timedelta
 import urllib.parse
 import urllib.request
-import geopy.distance  # 👈 トップレベル、またはここで必ずインポート
+import geopy.distance
+from functools import lru_cache
+import tempfile
 
-# ==========================================
-# ⚙️ サーバーが寝ても絶対に消えない保存箱
-# ==========================================
-if "locations" not in st.session_state:
-    st.session_state.locations = []
-if "editing_id" not in st.session_state: st.session_state.editing_id = None
-if "last_input" not in st.session_state: st.session_state.last_input = None
-if "schedule_results" not in st.session_state: st.session_state.schedule_results = None
+# ロギング
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- 🗺️ 住所から位置（緯度経度）を測る機能 ---
-def get_lat_lon_ai(address):
+# 定数
+DB_FILE = "locations_db.json"
+UNK_DISTANCE = 999.0
+
+# -------------------------
+# ルール種別の正規化ユーティリティ
+# -------------------------
+def normalize_rule_type(user_label: str) -> str:
+    """フォームラベルや既存データ（日本語）を内部キーに正規化する"""
+    if not user_label:
+        return "none"
+    mapping = {
+        "特になし": "none", "特なし": "none", "none": "none",
+        "○日まで": "until", "until": "until",
+        "○日〜○日の間": "range", "range": "range",
+        "○日ぴったり": "exact", "exact": "exact",
+    }
+    return mapping.get(user_label, "none")
+
+def denormalize_rule_type(internal_key: str) -> str:
+    """内部キーをフォーム表示用の日本語ラベルに変換する"""
+    inv = {"none": "特になし", "until": "○日まで", "range": "○日〜○日の間", "exact": "○日ぴったり"}
+    return inv.get(internal_key, "特になし")
+
+# -------------------------
+# ファイル入出力（原子的保存）
+# -------------------------
+def load_data(db_file: str = None):
+    """ファイルを読み込んで返す。読み込んだルール種別は内部キーに正規化する"""
+    path = db_file or DB_FILE
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # 互換性のため、各レコードの rule.type を正規化しておく
+            for loc in data:
+                # ensure fields exist and types normalized
+                loc.setdefault("rules", [])
+                loc.setdefault("intervals", [])
+                loc["lat"] = float(loc.get("lat", 0.0) or 0.0)
+                loc["lon"] = float(loc.get("lon", 0.0) or 0.0)
+                for r in loc["rules"]:
+                    r_type = r.get("type", "")
+                    r["type"] = normalize_rule_type(r_type)
+            return data
+        except Exception as e:
+            st.error(f"データベースの読み込みに失敗しました: {e}")
+            logging.error(f"DB load error: {e}")
+            return []
+    return []
+
+def save_data(locations=None, db_file: str = None):
+    """セッションの状態を物理ファイルに原子的に書き込む。
+       locations を渡せばそれを書き込む（テスト用に便利）。"""
+    path = db_file or DB_FILE
+    locs = locations if locations is not None else getattr(st.session_state, "locations", [])
+    try:
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix="locations_db_", suffix=".json")
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            json.dump(locs, f, ensure_ascii=False, indent=4)
+        os.replace(tmp_path, path)
+    except Exception as e:
+        # 注意: UIレイヤーでは st.error を出す。テストで呼ぶと streamlit がインポート済みなら st.error が動く。
+        try:
+            st.error(f"データベースの保存に失敗しました: {e}")
+        except Exception:
+            pass
+        logging.error(f"DB save error: {e}")
+
+# -------------------------
+# ジオコーディング（キャッシュ）
+# -------------------------
+@lru_cache(maxsize=1024)
+def get_lat_lon_ai_cached(address: str):
+    """アドレスに対する緯度経度をキャッシュするラッパー"""
+    return _get_lat_lon_ai(address)
+
+def _get_lat_lon_ai(address):
+    """国土地理院API を使って住所→(lat, lon) を返す。失敗時は (0.0,0.0)"""
     if not address:
         return 0.0, 0.0
     try:
         encoded_address = urllib.parse.quote(address)
         url = f"https://msearch.gsi.go.jp/address-search/AddressSearch?q={encoded_address}"
-        
-        req = urllib.request.Request(url, headers={'User-Agent': 'MoneyCollectionScheduler_v2'})
+        req = urllib.request.Request(url, headers={'User-Agent': 'MoneyCollectionScheduler_v3'})
         with urllib.request.urlopen(req, timeout=5) as response:
             data = json.loads(response.read().decode('utf-8'))
             if data and len(data) > 0:
                 lon, lat = data[0]["geometry"]["coordinates"]
                 return float(lat), float(lon)
-    except:
-        pass
+    except Exception as e:
+        logging.error(f"APIによる位置特定エラー: {e}")
     return 0.0, 0.0
 
-# 2点間の直線距離を計算する関数
-def calculate_distance(p1, p2):
+# -------------------------
+# 距離計算
+# -------------------------
+def calculate_geopy_distance(p1, p2):
+    """p1, p2 は (lat, lon)。未測定(0.0,0.0)があれば UNK_DISTANCE を返す"""
     if p1 == (0.0, 0.0) or p2 == (0.0, 0.0):
-        return 999.0  # 位置が分からないものは遠くとして扱う
-    return np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+        return UNK_DISTANCE
+    return geopy.distance.geodesic(p1, p2).km
 
+# -------------------------
+# ルールチェックユーティリティ
+# -------------------------
+def check_date_rule(rule, day_num):
+    """内部キーを使う: rule['type'] in ('none','until','range','exact')"""
+    if not rule or not rule.get("val"):
+        return True
+    rtype = normalize_rule_type(rule.get("type", "none"))
+    val = rule.get("val", "")
+    try:
+        if rtype == "range":
+            s, e = map(int, val.split('-'))
+            return s <= day_num <= e
+        elif rtype == "until":
+            return day_num <= int(val)
+        elif rtype == "exact":
+            return day_num == int(val)
+    except Exception as e:
+        logging.warning(f"日付ルールパースエラー (ルールを適用せずスキップ): {e}")
+        return True
+    return True
+
+def check_interval_rule(task, day, history_days):
+    """直前の訪問ステップとの間隔が守られているかを判定"""
+    span_rule = next((span for span in task.get("intervals", []) if span["to"] == task["step"]), None)
+    if span_rule:
+        for hist in history_days.get(task["loc_id"], []):
+            if hist["step"] == span_rule["from"]:
+                days_passed = abs((day - hist["day"]).days)
+                if days_passed < span_rule["span"]:
+                    return False
+    return True
+
+# ==========================================
+# Streamlit UI 本体（元のロジックを維持しつつ修正）
+# ==========================================
 st.set_page_config(page_title="集金スケジュール管理", layout="centered")
+st.title("💰 集金スケジュール管理 (改善版)")
 
-st.title("💰 集金スケジュール管理 (AI位置測定版)")
+# 初期化
+if "locations" not in st.session_state:
+    st.session_state.locations = load_data()
+if "editing_id" not in st.session_state:
+    st.session_state.editing_id = None
+if "schedule_results" not in st.session_state:
+    st.session_state.schedule_results = None
 
 tab_manage, tab_schedule = st.tabs(["📋 現場管理", "📅 スケジュール生成"])
 
-# ==========================================
-# 1. 📋 現場管理タブ
-# ==========================================
 with tab_manage:
     if not st.session_state.locations:
         st.info("現場が登録されていません。下のフォームから追加してください。")
@@ -57,7 +180,6 @@ with tab_manage:
         st.subheader("🏢 登録済みの会社・現場一覧")
         df = pd.DataFrame(st.session_state.locations)
         companies = df["company"].unique()
-        
         for comp in companies:
             with st.expander(f"🏢 {comp}", expanded=True):
                 comp_locs = df[df["company"] == comp]
@@ -68,19 +190,20 @@ with tab_manage:
                         st.markdown(f"**📍 {row['name']}** ({row['address']})")
                         st.caption(f"月 {row['count']} 回訪問 | {has_gps}")
                     with col_btn1:
-                        if st.button("編集", key=f"edit_{row['id']}"):
+                        if st.button("編集", key=f"edit_btn_{row['id']}"):
                             st.session_state.editing_id = row['id']
                             st.rerun()
                     with col_btn2:
-                        if st.button("削除", key=f"del_{row['id']}"):
+                        if st.button("削除", key=f"del_btn_{row['id']}"):
                             if st.session_state.editing_id == row['id']:
                                 st.session_state.editing_id = None
                             st.session_state.locations = [l for l in st.session_state.locations if l["id"] != row['id']]
+                            save_data()
                             st.toast("🗑️ 現場を削除しました。")
                             st.rerun()
 
     st.divider()
-    
+
     current_data = None
     if st.session_state.editing_id is not None:
         found = [l for l in st.session_state.locations if l["id"] == st.session_state.editing_id]
@@ -93,59 +216,103 @@ with tab_manage:
     if current_data is None:
         st.subheader("➕ 新しい現場を追加")
 
-    if "form_version" not in st.session_state:
-        st.session_state.form_version = 0
-
     default_count = current_data["count"] if current_data else 1
-    count = st.selectbox("🔄 月に行く合計回数を選んでください", list(range(1, 11)), index=(default_count-1))
+    if "form_count" not in st.session_state or current_data:
+        st.session_state.form_count = default_count
 
-    with st.form(f"location_form_{st.session_state.form_version}", clear_on_submit=True):
+    count = st.selectbox("🔄 月に行く合計回数を選んでください", list(range(1, 11)),
+                         index=int(st.session_state.form_count - 1), key="count_selector")
+    st.session_state.form_count = count
+
+    key_prefix = f"edit_{st.session_state.editing_id}" if st.session_state.editing_id is not None else "new_form"
+
+    with st.form(f"location_form_{st.session_state.editing_id}", clear_on_submit=False):
         company = st.text_input("🏢 会社名", value=current_data["company"] if current_data else "")
         name = st.text_input("📍 現場名", value=current_data["name"] if current_data else "")
         address = st.text_input("🗺️ 現場住所（正しい住所を入れると距離を測ります）", value=current_data["address"] if current_data else "")
-        
+
+        st.markdown("##### 🌐 位置情報の微調整（通常は自動入力されます）")
+        col_lat, col_lon = st.columns(2)
+        with col_lat:
+            form_lat = st.number_input("緯度（0.0の場合は位置不明）",
+                                       value=float(current_data["lat"]) if current_data else 0.0,
+                                       format="%.6f", key=f"{key_prefix}_lat")
+        with col_lon:
+            form_lon = st.number_input("経度（0.0の場合は位置不明）",
+                                       value=float(current_data["lon"]) if current_data else 0.0,
+                                       format="%.6f", key=f"{key_prefix}_lon")
+        st.caption("※住所自動検索が失敗（0.0）した場合は、Googleマップ等で調べた緯度経度をここに入力してください。")
+
         st.markdown("---")
         st.markdown("### 📅 各回収日の詳細ルール設定")
-        
+
+        existing_rules = {}
+        if current_data:
+            # 既に内部キーに正規化済みなのでそのまま使える
+            existing_rules = {r["step"]: r for r in current_data.get("rules", [])}
+
         rules = []
+        type_options = ["特になし", "○日まで", "○日〜○日の間", "○日ぴったり"]
         for i in range(1, count):
             st.markdown(f"**【{i}回目の集金】**")
-            r_type = st.radio(f"{i}回目のルール選択", ["特になし", "○日まで", "○日〜○日の間", "○日ぴったり"], key=f"type_{i}")
-            r_val = st.text_input(f"{i}回目の具体的な日付・期間 (例: 10、1-5)", key=f"val_{i}")
-            rules.append({"step": i, "type": r_type, "val": r_val, "is_last": False})
-        
+            saved_rule = existing_rules.get(i, {})
+            # saved_rule["type"] は内部キーかもしれない -> denormalize 前に normalize してから denormalize
+            saved_type_label = denormalize_rule_type(normalize_rule_type(saved_rule.get("type", "none")))
+            type_idx = type_options.index(saved_type_label) if saved_type_label in type_options else 0
+
+            r_type = st.radio(f"{i}回目のルール選択", type_options, index=type_idx, key=f"{key_prefix}_type_{i}")
+            r_val = st.text_input(f"{i}回目の具体的な日付・期間 (例: 10、1-5)", value=saved_rule.get("val", ""), key=f"{key_prefix}_val_{i}")
+            # 保存は内部キー化
+            rules.append({"step": i, "type": normalize_rule_type(r_type), "val": r_val, "is_last": False})
+
         st.markdown(f"**🏁【最終集金日（{count}回目）のルール】 ※必須事項**")
-        last_r_type = st.radio(f"最終集金のルール選択", ["特になし", "○日まで", "○日〜○日の間", "○日ぴったり"], key=f"type_last")
-        last_r_val = st.text_input(f"最終集金の具体的な日付・期間 (例: 25、20-25)", key=f"val_last")
-        rules.append({"step": count, "type": last_r_type, "val": last_r_val, "is_last": True})
-        
+        saved_last_rule = existing_rules.get(count, {})
+        saved_last_label = denormalize_rule_type(normalize_rule_type(saved_last_rule.get("type", "none")))
+        last_type_idx = type_options.index(saved_last_label) if saved_last_label in type_options else 0
+
+        last_r_type = st.radio(f"最終集金のルール選択", type_options, index=last_type_idx, key=f"{key_prefix}_type_last")
+        last_r_val = st.text_input(f"最終集金の具体的な日付・期間 (例: 25、20-25)", value=saved_last_rule.get("val", ""), key=f"{key_prefix}_val_last")
+        rules.append({"step": count, "type": normalize_rule_type(last_r_type), "val": last_r_val, "is_last": True})
+
+        existing_intervals = {int(intv["from"]): intv["span"] for intv in current_data.get("intervals", [])} if current_data else {}
+
         intervals = []
         if count >= 2:
             st.markdown("---")
             st.markdown("### ⏳ 間隔のルール")
             for i in range(1, count):
                 next_label = f"{i+1}回目" if i+1 < count else "最終集金"
-                span = st.number_input(f"「{i}回目」と「{next_label}」の間隔は何日以上空けますか？", min_value=0, max_value=30, value=0, key=f"span_{i}")
+                saved_span = existing_intervals.get(i, 0)
+                span = st.number_input(f"「{i}回目」と「{next_label}」の間隔は何日以上空けますか？", min_value=0, max_value=30, value=int(saved_span), key=f"{key_prefix}_span_{i}")
                 intervals.append({"from": i, "to": i+1, "span": span})
 
         st.markdown("---")
         st.markdown("### 🗓️ 曜日・休日のルール")
-        sat = st.checkbox("土曜日も入れてよい", value=True)
-        sun = st.checkbox("日曜日も入れてよい", value=False)
+        sat = st.checkbox("土曜日も入れてよい", value=current_data.get("sat", True) if current_data else True, key=f"{key_prefix}_sat")
+        sun = st.checkbox("日曜日も入れてよい", value=current_data.get("sun", False) if current_data else False, key=f"{key_prefix}_sun")
 
         submitted = st.form_submit_button("更新する" if st.session_state.editing_id is not None else "現場を登録する")
-        
+
         if submitted:
             if company and name and address:
-                with st.spinner("🌍 住所から正確な位置を測定中..."):
-                    lat, lon = get_lat_lon_ai(address)
-                
+                # 住所が変わったら API で再取得。キャッシュラッパーを使用
+                if current_data and current_data["address"] == address:
+                    lat, lon = form_lat, form_lon
+                else:
+                    with st.spinner("🌍 住所から正確な位置を測定中..."):
+                        lat, lon = get_lat_lon_ai_cached(address)
+                    if lat == 0.0 and lon == 0.0:
+                        if form_lat != 0.0 or form_lon != 0.0:
+                            lat, lon = form_lat, form_lon
+                        else:
+                            st.warning("⚠️ 住所の位置を自動特定できませんでした。位置を特定できないまま登録します。")
+
                 form_data = {
                     "company": company, "name": name, "address": address, "count": count,
                     "rules": rules, "intervals": intervals, "sat": sat, "sun": sun,
-                    "lat": lat, "lon": lon
+                    "lat": float(lat), "lon": float(lon)
                 }
-                
+
                 if st.session_state.editing_id is not None:
                     form_data["id"] = st.session_state.editing_id
                     for idx, loc in enumerate(st.session_state.locations):
@@ -155,27 +322,24 @@ with tab_manage:
                     st.session_state.editing_id = None
                     st.success(f"✨ 「{name}」の情報を上書き更新しました！")
                 else:
-                    form_data["id"] = max([loc["id"] for loc in st.session_state.locations] + [0]) + 1
+                    current_ids = [loc["id"] for loc in st.session_state.locations]
+                    form_data["id"] = max(current_ids + [0]) + 1
                     st.session_state.locations.append(form_data)
                     st.success(f"🎉 新しい現場「{name}」を追加しました！")
-                    st.session_state.form_version += 1
-                
-                st.session_state.last_input = form_data
+
+                save_data()
                 st.rerun()
             else:
                 st.error("会社名、現場名、住所は必須入力です。")
-                
+
     if st.session_state.editing_id is not None:
         if st.button("編集をキャンセル"):
             st.session_state.editing_id = None
             st.rerun()
 
-# ==========================================
-# 2. 📅 スケジュール生成タブ（大量現場・最適化版）
-# ==========================================
 with tab_schedule:
     st.subheader("📅 月間スケジュールの自動生成")
-    
+
     now = datetime.today()
     st.markdown("### 📅 スケジュールを組む月を選択してください")
     col_year, col_month = st.columns(2)
@@ -183,7 +347,26 @@ with tab_schedule:
         target_year = st.selectbox("年", [now.year - 1, now.year, now.year + 1], index=1)
     with col_month:
         target_month = st.selectbox("月", list(range(1, 13)), index=now.month - 1)
-    
+
+    st.markdown("---")
+    st.markdown("### 🎌 除外する休日（祝日・社休日など）の設定")
+    custom_holidays = st.date_input(
+        "稼働させたくない特異日・祝日をすべて選択してください（複数選択可）",
+        value=[],
+        help="カレンダーから日付を複数選ぶことができます。選択された日は集金を割り当てません。"
+    )
+
+    holiday_set = set()
+    if isinstance(custom_holidays, (list, tuple)):
+        holiday_set = {d.strftime('%Y-%m-%d') for d in custom_holidays if d}
+    elif hasattr(custom_holidays, 'strftime'):
+        holiday_set = {custom_holidays.strftime('%Y-%m-%d')}
+
+    if holiday_set:
+        st.caption(f"🚫 以下の日程は休日（除外日）としてスキップされます: `{', '.join(sorted(holiday_set))}`")
+    else:
+        st.caption("ℹ️ 個別の日付除外（休日設定）はされていません。土日制限のみ適用されます。")
+
     st.markdown("---")
     st.markdown("### 🚗 1日の件数は何件から何件にしますか？")
     col_min, col_max = st.columns(2)
@@ -192,7 +375,7 @@ with tab_schedule:
     with col_max:
         max_tasks = st.selectbox("最大件数", list(range(1, 12)), index=4)
     st.divider()
-    
+
     if st.button("🚀 位置（距離）を計算してスケジュールを自動生成する", type="primary"):
         if not st.session_state.locations:
             st.error("現場データが登録されていません。一覧に登録されているデータが必要です。")
@@ -202,135 +385,194 @@ with tab_schedule:
                 end_date = datetime(target_year + 1, 1, 1) - timedelta(days=1)
             else:
                 end_date = datetime(target_year, target_month + 1, 1) - timedelta(days=1)
-            
+
             days_in_month = (end_date - start_date).days + 1
             all_days = [start_date + timedelta(days=x) for x in range(days_in_month)]
-            
-            # タスクプールを作成
+
+            # タスクプール作成（ルールは内部キー）
             task_pool = []
             for loc in st.session_state.locations:
                 for step_idx in range(loc["count"]):
+                    rules_list = loc.get("rules", [])
+                    rule = next((r for r in rules_list if r["step"] == step_idx + 1), {"type": "none", "val": ""})
+
+                    priority = 0
+                    if rule["type"] in ["exact", "range"]:
+                        priority += 20
+                    elif rule["type"] == "until":
+                        priority += 10
+                    if step_idx + 1 == loc["count"]:
+                        priority += 5
+
                     task_pool.append({
                         "loc_id": loc["id"], "company": loc["company"], "name": loc["name"],
                         "lat": loc.get("lat", 0.0), "lon": loc.get("lon", 0.0),
-                        "step": step_idx + 1, "rules": loc.get("rules", []),
-                        "sat": loc.get("sat", True), "sun": loc.get("sun", False)
+                        "step": step_idx + 1, "rule": rule, "priority": priority,
+                        "sat": loc.get("sat", True), "sun": loc.get("sun", False),
+                        "intervals": loc.get("intervals", [])
                     })
-            
-            # --- 新・距離計算関数（geopy版） ---
-            def calculate_geopy_distance(p1, p2):
-                if p1 == (0.0, 0.0) or p2 == (0.0, 0.0):
-                    return 999.0
-                return geopy.distance.geodesic(p1, p2).km
 
             current_schedule = {day.strftime('%Y-%m-%d'): [] for day in all_days}
-            
-            # 【最善策】大量の現場を捌くため、条件の厳しいタスク（ステップ順、かつ制約が多いもの）を優先するベースを作る
-            unassigned_tasks = sorted(task_pool, key=lambda x: (x['step'], x['loc_id']))
+            unassigned_tasks = sorted(task_pool, key=lambda x: (-x['priority'], x['step'], x['loc_id']))
+            history_days = {loc["id"]: [] for loc in st.session_state.locations}
 
-            last_visited_day = {loc["id"]: None for loc in st.session_state.locations}
-            prev_day_last_loc = (0.0, 0.0)
-            last_active_day = None
+            overflow_tasks = []
 
-            # --- メインループ ---
-            for day in all_days:
-                day_str = day.strftime('%Y-%m-%d')
-                d_num = day.day
-                w = day.weekday()
-                
-                if last_active_day is not None and (day - last_active_day).days > 1:
-                    prev_day_last_loc = (0.0, 0.0)
-                
-                while len(current_schedule[day_str]) < max_tasks:
-                    best_task_idx = -1
-                    min_dist = 999999.0
-                    
-                    last_loc = (0.0, 0.0)
+            for task in unassigned_tasks:
+                best_day = None
+                min_score = float('inf')
+
+                for day in all_days:
+                    day_str = day.strftime('%Y-%m-%d')
+                    d_num = day.day
+                    w = day.weekday()
+
+                    if day_str in holiday_set: continue
+                    if w == 5 and not task["sat"]: continue
+                    if w == 6 and not task["sun"]: continue
+                    if not check_date_rule(task["rule"], d_num): continue
+                    if len(current_schedule[day_str]) >= max_tasks: continue
+                    if not check_interval_rule(task, day, history_days): continue
+
+                    current_count = len(current_schedule[day_str])
+
                     if current_schedule[day_str]:
-                        last_loc = (current_schedule[day_str][-1]["lat"], current_schedule[day_str][-1]["lon"])
+                        valid_last_loc = (0.0, 0.0)
+                        for existing_task in reversed(current_schedule[day_str]):
+                            if existing_task["lat"] != 0.0 and existing_task["lon"] != 0.0:
+                                valid_last_loc = (existing_task["lat"], existing_task["lon"])
+                                break
+                        dist = calculate_geopy_distance(valid_last_loc, (task["lat"], task["lon"]))
                     else:
-                        last_loc = prev_day_last_loc
-                        
-                    for idx, task in enumerate(unassigned_tasks):
-                        # 1. 曜日制限
+                        dist = 0.0
+
+                    score = (current_count * 5.0) + dist
+
+                    if score < min_score:
+                        min_score = score
+                        best_day = day
+
+                if best_day:
+                    best_day_str = best_day.strftime('%Y-%m-%d')
+                    current_schedule[best_day_str].append(task)
+                    history_days[task["loc_id"]].append({"step": task["step"], "day": best_day})
+                else:
+                    overflow_tasks.append(task)
+
+            # あふれたタスクの再配置
+            for task in overflow_tasks:
+                best_day = None
+                min_score = float('inf')
+
+                for allowed_max in range(max_tasks, max_tasks + 10):
+                    for day in all_days:
+                        day_str = day.strftime('%Y-%m-%d')
+                        d_num = day.day
+                        w = day.weekday()
+
+                        if day_str in holiday_set: continue
                         if w == 5 and not task["sat"]: continue
                         if w == 6 and not task["sun"]: continue
-                        
-                        # 2. 日付詳細ルール
-                        rule = next((r for r in task["rules"] if r["step"] == task["step"]), None)
-                        if rule and rule.get("val"):
-                            try:
-                                if rule["type"] == "○日〜○日の間":
-                                    s, e = map(int, rule["val"].split('-'))
-                                    if not (s <= d_num <= e): continue
-                                elif rule["type"] == "○日まで":
-                                    if d_num > int(rule["val"]): continue
-                                elif rule["type"] == "○日ぴったり":
-                                    if d_num != int(rule["val"]): continue
-                            except: pass
-                        
-                        # 3. 間隔ルール
-                        if task["step"] > 1:
-                            last_day = last_visited_day[task["loc_id"]]
-                            if last_day is not None:
-                                days_passed = (day - last_day).days
-                                loc_data = next(l for l in st.session_state.locations if l["id"] == task["loc_id"])
-                                span_rule = next((span for span in loc_data.get("intervals", []) if span["to"] == task["step"]), None)
-                                if span_rule and days_passed < span_rule["span"]:
-                                    continue
-                        
-                        # 4. 距離の計算（geopyを適用）
-                        dist = calculate_geopy_distance(last_loc, (task["lat"], task["lon"]))
-                        if dist < min_dist:
-                            min_dist = dist
-                            best_task_idx = idx
-                                
-                    if best_task_idx != -1:
-                        chosen_task = unassigned_tasks.pop(best_task_idx)
-                        current_schedule[day_str].append(chosen_task)
-                        last_visited_day[chosen_task["loc_id"]] = day
-                        
-                        prev_day_last_loc = (chosen_task["lat"], chosen_task["lon"])
-                        last_active_day = day
-                    else:
+                        if not check_date_rule(task["rule"], d_num): continue
+                        if not check_interval_rule(task, day, history_days): continue
+                        if len(current_schedule[day_str]) >= allowed_max: continue
+
+                        current_count = len(current_schedule[day_str])
+                        if current_schedule[day_str]:
+                            valid_last_loc = (0.0, 0.0)
+                            for existing_task in reversed(current_schedule[day_str]):
+                                if existing_task["lat"] != 0.0 and existing_task["lon"] != 0.0:
+                                    valid_last_loc = (existing_task["lat"], existing_task["lon"])
+                                    break
+                            dist = calculate_geopy_distance(valid_last_loc, (task["lat"], task["lon"]))
+                        else:
+                            dist = 0.0
+
+                        score = (current_count * 5.0) + dist
+                        if score < min_score:
+                            min_score = score
+                            best_day = day
+
+                    if best_day:
                         break
 
-            # --- 🛠️ 【超重要】溢れた大量タスクの「スマート近隣分配」処理 ---
-            if unassigned_tasks:
-                # 残ってしまったタスクを1つずつループ
-                for task in unassigned_tasks:
-                    best_day_str = None
-                    min_overflow_dist = 999999.0
-                    
-                    # カレンダー全日程をスキャンして、「最も距離が近くなる日」を探す
+                if best_day:
+                    best_day_str = best_day.strftime('%Y-%m-%d')
+                    current_schedule[best_day_str].append(task)
+                    history_days[task["loc_id"]].append({"step": task["step"], "day": best_day})
+                else:
+                    # フォールバック
+                    fallback_day = None
                     for day in all_days:
-                        target_day_str = day.strftime('%Y-%m-%d')
-                        
-                        # 1日の最大件数を超えていない日だけが対象
-                        if len(current_schedule[target_day_str]) < max_tasks:
-                            # その日の最後の現場、もしくは最初の現場との距離を測る
-                            if current_schedule[target_day_str]:
-                                compare_loc = (current_schedule[target_day_str][-1]["lat"], current_schedule[target_day_str][-1]["lon"])
-                            else:
-                                compare_loc = (0.0, 0.0)
-                            
-                            dist = calculate_geopy_distance(compare_loc, (task["lat"], task["lon"]))
-                            if dist < min_overflow_dist:
-                                min_overflow_dist = dist
-                                best_day_str = target_day_str
-                    
-                    # 最もルートが効率的になる日にねじ込む
-                    if best_day_str:
-                        current_schedule[best_day_str].append(task)
+                        day_str = day.strftime('%Y-%m-%d')
+                        if day_str in holiday_set: continue
+                        w = day.weekday()
+                        if w == 5 and not task["sat"]: continue
+                        if w == 6 and not task["sun"]: continue
+                        if check_date_rule(task["rule"], day.day):
+                            fallback_day = day
+                            break
 
-            st.session_state.locations_count = len(st.session_state.locations)
+                    if not fallback_day:
+                        for day in all_days:
+                            if day.strftime('%Y-%m-%d') not in holiday_set:
+                                fallback_day = day
+                                break
+                        if not fallback_day:
+                            fallback_day = all_days[0]
+
+                    current_schedule[fallback_day.strftime('%Y-%m-%d')].append(task)
+                    history_days[task["loc_id"]].append({"step": task["step"], "day": fallback_day})
+
+            # ルートソート（Greedy）
+            for day_str in current_schedule:
+                if len(current_schedule[day_str]) > 1:
+                    ordered_tasks = []
+                    unvisited = current_schedule[day_str].copy()
+
+                    first_task = None
+                    for idx, t in enumerate(unvisited):
+                        if t["lat"] != 0.0 and t["lon"] != 0.0:
+                            first_task = unvisited.pop(idx)
+                            break
+                    if not first_task:
+                        first_task = unvisited.pop(0)
+
+                    current_loc = (first_task["lat"], first_task["lon"])
+                    ordered_tasks.append(first_task)
+
+                    while unvisited:
+                        closest_idx = 0
+                        min_d = float('inf')
+                        for idx, t in enumerate(unvisited):
+                            if t["lat"] == 0.0 or t["lon"] == 0.0:
+                                d = 9999.0
+                            else:
+                                d = calculate_geopy_distance(current_loc, (t["lat"], t["lon"]))
+
+                            if d < min_d:
+                                min_d = d
+                                closest_idx = idx
+
+                        next_task = unvisited.pop(closest_idx)
+                        if next_task["lat"] != 0.0 and next_task["lon"] != 0.0:
+                            current_loc = (next_task["lat"], next_task["lon"])
+                        ordered_tasks.append(next_task)
+
+                    current_schedule[day_str] = ordered_tasks
+
             st.session_state.schedule_results = {"calculated": True, "schedule": current_schedule}
 
-    # スケジュール結果の表示（ボタンの外側）
     if st.session_state.schedule_results and st.session_state.schedule_results["calculated"]:
         st.success("🗺️ 各現場のルート距離を計算し、最も効率の良いスケジュールを生成しました！")
+
         for day_str, tasks in st.session_state.schedule_results["schedule"].items():
             if tasks:
-                st.markdown(f"#### 📅 {day_str} ({len(tasks)} 件)")
-                for t in tasks:
-                    st.write(f"- 🏢 {t['company']} ： {t['name']} （{t['step']}回目）")
+                date_obj = datetime.strptime(day_str, '%Y-%m-%d')
+                weekday_str = ["月", "火", "水", "木", "金", "土", "日"][date_obj.weekday()]
+
+                st.markdown(f"#### 📅 {day_str} ({weekday_str})  —  `{len(tasks)} 件`")
+                for idx, t in enumerate(tasks, 1):
+                    geo_alert = " ⚠️ *(位置不明のためルート末尾に配置)*" if t["lat"] == 0.0 else ""
+                    st.write(f"**{idx}.** 🏢 {t['company']} ： {t['name']} （{t['step']}回目）{geo_alert}")
+                st.divider()
