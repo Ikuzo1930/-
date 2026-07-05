@@ -1,5 +1,4 @@
 streamlit>=1.0
 pandas
-numpy
 geopy
 pytest
