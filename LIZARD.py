@@ -1,13 +1,14 @@
 # app_improved.py
 """
 完全版: Streamlit アプリ（改善済み）
-- 住所入力をフォーム外に移動して on_change を使用
+- DB の保存先をスクリプトのあるディレクトリに固定（絶対パス）
+- 既存ファイルのバックアップを作成してから原子的に置換して保存
 - GEO_CACHE（成功時のみキャッシュ） + キャッシュクリア
-- save_data: 原子的書き込み（tmp -> os.replace）
+- 住所入力をフォーム外で on_change（住所入力で即時緯度経度反映）
 - choose_fallback_day: current_schedule/history_days を考慮して安全化
 - forced_fallback フラグの付与と UI 表示
-- ルートソートの安全化
-- フォーム内に現場名 (name) 入力欄を確実に配置（NameError 対策）
+- ルートソートの安全化（remove/pop）
+- 以前のバグ修正（NameError 等）を含む
 """
 import streamlit as st
 import pandas as pd
@@ -20,16 +21,23 @@ import urllib.request
 import geopy.distance
 import tempfile
 import time
+from pathlib import Path
+import shutil
 
 # ロギング
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# 定数
-DB_FILE = "locations_db.json"
+# -------------------------
+# DB パス（スクリプトのあるディレクトリに固定）
+# -------------------------
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "locations_db.json"
+DB_BACKUP_PATH = BASE_DIR / "locations_db.json.bak"
+
 UNK_DISTANCE = 999.0
 
 # -------------------------
-# ルール種別の正規化ユーティリティ
+# ユーティリティ：ルール正規化
 # -------------------------
 def normalize_rule_type(user_label: str) -> str:
     if not user_label:
@@ -47,15 +55,16 @@ def denormalize_rule_type(internal_key: str) -> str:
     return inv.get(internal_key, "特になし")
 
 # -------------------------
-# ファイル入出力（原子的保存）
+# ファイル入出力（原子的保存 + バックアップ）
 # -------------------------
-def load_data(db_file: str = None):
-    path = db_file or DB_FILE
-    if os.path.exists(path):
-        try:
+def load_data(db_file: str | Path | None = None):
+    path = Path(db_file) if db_file else DB_PATH
+    logging.info(f"Loading DB from: {path}")
+    try:
+        if path.exists():
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            # 互換性のため、各レコードの rule.type を内部キーに正規化
+            # 互換性のため正規化
             for loc in data:
                 loc.setdefault("rules", [])
                 loc.setdefault("intervals", [])
@@ -64,26 +73,51 @@ def load_data(db_file: str = None):
                 for r in loc["rules"]:
                     r_type = r.get("type", "")
                     r["type"] = normalize_rule_type(r_type)
-            return data
-        except Exception as e:
-            logging.error(f"DB load error: {e}")
+            logging.info(f"Loaded {len(data)} locations from {path} (size={path.stat().st_size} bytes)")
             try:
-                st.error(f"データベースの読み込みに失敗しました: {e}")
+                st.caption(f"DB path: `{path}`  — size: {path.stat().st_size} bytes")
+            except Exception:
+                pass
+            return data
+        else:
+            logging.info(f"No DB file found at {path} (will start with empty list)")
+            try:
+                st.caption(f"DB path: `{path}` (not found; will create on save)")
             except Exception:
                 pass
             return []
-    return []
+    except Exception as e:
+        logging.error(f"DB load error from {path}: {e}")
+        try:
+            st.error(f"データベースの読み込みに失敗しました: {e}")
+        except Exception:
+            pass
+        return []
 
-def save_data(locations=None, db_file: str = None):
-    path = db_file or DB_FILE
+def save_data(locations=None, db_file: str | Path | None = None):
+    path = Path(db_file) if db_file else DB_PATH
     locs = locations if locations is not None else getattr(st.session_state, "locations", [])
     try:
-        tmp_fd, tmp_path = tempfile.mkstemp(prefix="locations_db_", suffix=".json")
+        # バックアップ
+        if path.exists():
+            try:
+                shutil.copy2(path, DB_BACKUP_PATH)
+                logging.info(f"Backup created: {DB_BACKUP_PATH}")
+            except Exception as e:
+                logging.warning(f"Could not backup existing DB: {e}")
+
+        # tmp を BASE_DIR に作る（同一ファイルシステムで atomic replace）
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix="locations_db_", suffix=".json", dir=str(BASE_DIR))
         with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
             json.dump(locs, f, ensure_ascii=False, indent=4)
         os.replace(tmp_path, path)
+        logging.info(f"Saved DB to {path} (items={len(locs)})")
+        try:
+            st.success("データを保存しました。")
+        except Exception:
+            pass
     except Exception as e:
-        logging.error(f"DB save error: {e}")
+        logging.error(f"DB save error to {path}: {e}")
         try:
             st.error(f"データベースの保存に失敗しました: {e}")
         except Exception:
@@ -121,7 +155,6 @@ def get_lat_lon_ai_cached(address: str):
         lat, lon, ts = cached
         return lat, lon
     lat, lon = _get_lat_lon_ai(address)
-    # 成功時のみキャッシュ
     if lat != 0.0 or lon != 0.0:
         GEO_CACHE[address] = (lat, lon, time.time())
     return lat, lon
@@ -181,6 +214,7 @@ def choose_fallback_day(all_days, holiday_set, task, current_schedule=None, hist
                 return True
         return False
 
+    # 1) 非休日・ルール合致・間隔OK・同日重複なし を満たす最初の日
     for day in all_days:
         day_str = day.strftime('%Y-%m-%d')
         if day_str in holiday_set:
@@ -198,6 +232,7 @@ def choose_fallback_day(all_days, holiday_set, task, current_schedule=None, hist
             continue
         return day, False
 
+    # 2) 非休日かつ同日重複なし（日付ルールは緩める）
     for day in all_days:
         day_str = day.strftime('%Y-%m-%d')
         if day_str in holiday_set:
@@ -206,6 +241,7 @@ def choose_fallback_day(all_days, holiday_set, task, current_schedule=None, hist
             continue
         return day, False
 
+    # 3) 本当に見つからなければ強制割当（最初の全日）
     logging.warning(f"フォールバック: どのルールにも合致しないため強制割当 (loc_id={task.get('loc_id')}, step={task.get('step')})")
     return all_days[0], True
 
@@ -306,7 +342,6 @@ with tab_manage:
 
     with st.form(f"location_form_{st.session_state.editing_id}", clear_on_submit=False):
         company = st.text_input("🏢 会社名", value=current_data["company"] if current_data else "")
-        # ← ここに現場名欄を必ず置く（NameError の原因を解消）
         name = st.text_input("📍 現場名", value=current_data["name"] if current_data else "", key=f"{key_prefix}_name")
 
         st.markdown("##### 🌐 位置情報の微調整（通常は自動入力されます）")
@@ -405,6 +440,7 @@ with tab_manage:
             st.session_state.editing_id = None
             st.rerun()
 
+# スケジュール生成タブ（前と同様のロジック。overflow のフォールバック呼び出しは choose_fallback_day(..., current_schedule=current_schedule, history_days=history_days) を使う）
 with tab_schedule:
     st.subheader("📅 月間スケジュールの自動生成")
     now = datetime.today()
