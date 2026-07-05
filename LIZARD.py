@@ -1,15 +1,13 @@
 # app_improved.py
 """
-完全版: Streamlit アプリ（改善済み）
-- DB の保存先をスクリプトのあるディレクトリに固定（絶対パス）
-- 既存ファイルのバックアップを作成してから原子的に置換して保存
-- GEO_CACHE（成功時のみキャッシュ） + キャッシュクリア
-- 住所入力をフォーム外で on_change（住所入力で即時緯度経度反映）
-- choose_fallback_day: current_schedule/history_days を考慮して安全化
-- forced_fallback フラグの付与と UI 表示
-- ルートソートの安全化（remove/pop）
-- 以前のバグ修正（NameError 等）を含む
+Streamlit アプリ（Supabase 永続化版）
+- 優先: Supabase に保存/読み出し
+- 未設定/失敗時: ローカル SQLite にフォールバック
+- 既存 locations_db.json があれば起動時に自動マイグレーション（Supabase または SQLite へ）
+- 成功時のみジオキャッシュ、キャッシュクリアボタン、住所の on_change（フォーム外）、
+  フォールバック安全化、ルートソート安全化、現場名フィールド等を包含
 """
+from __future__ import annotations
 import streamlit as st
 import pandas as pd
 import json
@@ -23,21 +21,54 @@ import tempfile
 import time
 from pathlib import Path
 import shutil
+import sqlite3
+
+# Supabase client
+try:
+    from supabase import create_client
+except Exception:
+    create_client = None  # optional; fallback to sqlite
 
 # ロギング
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # -------------------------
-# DB パス（スクリプトのあるディレクトリに固定）
+# パス / 定数
 # -------------------------
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "locations_db.json"
-DB_BACKUP_PATH = BASE_DIR / "locations_db.json.bak"
-
+JSON_OLD_PATH = BASE_DIR / "locations_db.json"
 UNK_DISTANCE = 999.0
 
 # -------------------------
-# ユーティリティ：ルール正規化
+# Supabase 設定（st.secrets または環境変数）
+# -------------------------
+def get_supabase_client():
+    url = None
+    key = None
+    try:
+        # Streamlit Cloud の Secrets を優先
+        url = st.secrets.get("SUPABASE_URL") if isinstance(st.secrets, dict) else None
+        key = st.secrets.get("SUPABASE_KEY") if isinstance(st.secrets, dict) else None
+    except Exception:
+        # st.secrets may be not mapping in some contexts; fallback to env
+        pass
+    if not url:
+        url = os.getenv("SUPABASE_URL")
+    if not key:
+        key = os.getenv("SUPABASE_KEY")
+    if not url or not key or create_client is None:
+        return None
+    try:
+        client = create_client(url, key)
+        return client
+    except Exception as e:
+        logging.error(f"Supabase client init failed: {e}")
+        return None
+
+SUPABASE = get_supabase_client()
+
+# -------------------------
+# ルール正規化
 # -------------------------
 def normalize_rule_type(user_label: str) -> str:
     if not user_label:
@@ -55,79 +86,186 @@ def denormalize_rule_type(internal_key: str) -> str:
     return inv.get(internal_key, "特になし")
 
 # -------------------------
-# ファイル入出力（原子的保存 + バックアップ）
+# データ保存/読み込み：Supabase と SQLite フォールバック
 # -------------------------
-def load_data(db_file: str | Path | None = None):
-    path = Path(db_file) if db_file else DB_PATH
-    logging.info(f"Loading DB from: {path}")
+SQLITE_DB = BASE_DIR / "locations.db"
+SQLITE_BAK = BASE_DIR / "locations.db.bak"
+
+def init_sqlite(db_path: Path):
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS locations (
+                    id INTEGER PRIMARY KEY,
+                    data TEXT NOT NULL
+                   )""")
+    conn.commit()
+    conn.close()
+
+def load_data_sqlite(db_file: Path | None = None):
+    db_path = db_file or SQLITE_DB
     try:
-        if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            # 互換性のため正規化
-            for loc in data:
-                loc.setdefault("rules", [])
-                loc.setdefault("intervals", [])
-                loc["lat"] = float(loc.get("lat", 0.0) or 0.0)
-                loc["lon"] = float(loc.get("lon", 0.0) or 0.0)
-                for r in loc["rules"]:
-                    r_type = r.get("type", "")
-                    r["type"] = normalize_rule_type(r_type)
-            logging.info(f"Loaded {len(data)} locations from {path} (size={path.stat().st_size} bytes)")
-            try:
-                st.caption(f"DB path: `{path}`  — size: {path.stat().st_size} bytes")
-            except Exception:
-                pass
-            return data
-        else:
-            logging.info(f"No DB file found at {path} (will start with empty list)")
-            try:
-                st.caption(f"DB path: `{path}` (not found; will create on save)")
-            except Exception:
-                pass
+        if not db_path.exists():
+            init_sqlite(db_path)
             return []
+        init_sqlite(db_path)
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT data FROM locations ORDER BY id")
+        rows = cur.fetchall()
+        conn.close()
+        items = []
+        for (d,) in rows:
+            try:
+                obj = json.loads(d)
+            except Exception:
+                continue
+            obj.setdefault("rules", [])
+            obj.setdefault("intervals", [])
+            obj["lat"] = float(obj.get("lat", 0.0) or 0.0)
+            obj["lon"] = float(obj.get("lon", 0.0) or 0.0)
+            for r in obj["rules"]:
+                r["type"] = normalize_rule_type(r.get("type", "none"))
+            items.append(obj)
+        logging.info(f"Loaded {len(items)} locations from sqlite {db_path}")
+        return items
     except Exception as e:
-        logging.error(f"DB load error from {path}: {e}")
-        try:
-            st.error(f"データベースの読み込みに失敗しました: {e}")
-        except Exception:
-            pass
+        logging.error(f"SQLite load error: {e}")
         return []
 
-def save_data(locations=None, db_file: str | Path | None = None):
-    path = Path(db_file) if db_file else DB_PATH
-    locs = locations if locations is not None else getattr(st.session_state, "locations", [])
+def save_data_sqlite(locations: list, db_file: Path | None = None):
+    db_path = db_file or SQLITE_DB
     try:
-        # バックアップ
-        if path.exists():
+        if db_path.exists():
             try:
-                shutil.copy2(path, DB_BACKUP_PATH)
-                logging.info(f"Backup created: {DB_BACKUP_PATH}")
-            except Exception as e:
-                logging.warning(f"Could not backup existing DB: {e}")
-
-        # tmp を BASE_DIR に作る（同一ファイルシステムで atomic replace）
-        tmp_fd, tmp_path = tempfile.mkstemp(prefix="locations_db_", suffix=".json", dir=str(BASE_DIR))
-        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-            json.dump(locs, f, ensure_ascii=False, indent=4)
-        os.replace(tmp_path, path)
-        logging.info(f"Saved DB to {path} (items={len(locs)})")
-        try:
-            st.success("データを保存しました。")
-        except Exception:
-            pass
+                shutil.copy2(db_path, SQLITE_BAK)
+            except Exception:
+                pass
+        tmp_db = Path(str(db_path.parent)) / f"{db_path.stem}_{int(time.time())}.tmp.db"
+        init_sqlite(tmp_db)
+        conn = sqlite3.connect(tmp_db)
+        cur = conn.cursor()
+        # write all records
+        for loc in locations:
+            lid = int(loc.get("id", 0)) if loc.get("id") is not None else None
+            cur.execute("INSERT INTO locations (id, data) VALUES (?, ?)", (lid, json.dumps(loc, ensure_ascii=False)))
+        conn.commit()
+        conn.close()
+        os.replace(tmp_db, db_path)
+        logging.info(f"Saved {len(locations)} locations to sqlite {db_path}")
+        return True
     except Exception as e:
-        logging.error(f"DB save error to {path}: {e}")
+        logging.error(f"SQLite save error: {e}")
+        return False
+
+# Supabase-based functions
+def load_data_supabase():
+    if SUPABASE is None:
+        return None
+    try:
+        res = SUPABASE.table("locations").select("data").order("id", {"ascending": True}).execute()
+        data = res.data if hasattr(res, "data") else (res.get("data") if isinstance(res, dict) else None)
+        if not data:
+            return []
+        items = []
+        for r in data:
+            # r could be {'data': {...}} or direct
+            obj = r.get("data") if isinstance(r, dict) and "data" in r else r
+            if isinstance(obj, str):
+                try:
+                    obj = json.loads(obj)
+                except Exception:
+                    continue
+            if not isinstance(obj, dict):
+                continue
+            obj.setdefault("rules", [])
+            obj.setdefault("intervals", [])
+            obj["lat"] = float(obj.get("lat", 0.0) or 0.0)
+            obj["lon"] = float(obj.get("lon", 0.0) or 0.0)
+            for rr in obj["rules"]:
+                rr["type"] = normalize_rule_type(rr.get("type", "none"))
+            items.append(obj)
+        logging.info(f"Loaded {len(items)} locations from Supabase")
+        return items
+    except Exception as e:
+        logging.error(f"Supabase load error: {e}")
+        return None
+
+def save_data_supabase(locations: list):
+    if SUPABASE is None:
+        return None
+    try:
+        # simple replace: delete all then insert
+        SUPABASE.table("locations").delete().neq("id", -1).execute()
+        to_insert = []
+        for loc in locations:
+            to_insert.append({"id": int(loc.get("id", 0)), "data": loc})
+        # insert in chunks to avoid huge payload
+        CHUNK = 100
+        for i in range(0, len(to_insert), CHUNK):
+            chunk = to_insert[i:i+CHUNK]
+            SUPABASE.table("locations").insert(chunk).execute()
+        logging.info(f"Saved {len(locations)} locations to Supabase")
+        return True
+    except Exception as e:
+        logging.error(f"Supabase save error: {e}")
+        return None
+
+# High-level load/save: prefer Supabase, fallback to SQLite
+def load_data():
+    # try supabase
+    sup_res = load_data_supabase() if SUPABASE is not None else None
+    if sup_res is not None:
+        return sup_res
+    # else try sqlite
+    return load_data_sqlite()
+
+def save_data(locations=None):
+    locs = locations if locations is not None else getattr(st.session_state, "locations", [])
+    # try supabase
+    if SUPABASE is not None:
+        ok = save_data_supabase(locs)
+        if ok is not None:
+            return ok
+    # fallback sqlite
+    return save_data_sqlite(locs)
+
+# Auto-migrate JSON old file to Supabase (or to SQLite fallback)
+def migrate_json_to_backend():
+    if not JSON_OLD_PATH.exists():
+        return
+    try:
+        with open(JSON_OLD_PATH, "r", encoding="utf-8") as f:
+            items = json.load(f)
+    except Exception:
+        logging.warning("Old JSON exists but failed to read")
+        return
+    if SUPABASE is not None:
         try:
-            st.error(f"データベースの保存に失敗しました: {e}")
-        except Exception:
-            pass
+            # insert into supabase
+            to_insert = []
+            for loc in items:
+                to_insert.append({"id": int(loc.get("id", 0)), "data": loc})
+            SUPABASE.table("locations").insert(to_insert).execute()
+            shutil.copy2(JSON_OLD_PATH, JSON_OLD_PATH.with_suffix(".json.migrated"))
+            logging.info("Migrated old JSON to Supabase")
+            return
+        except Exception as e:
+            logging.warning(f"Migration to Supabase failed: {e}")
+    # fallback: save to sqlite
+    try:
+        save_data_sqlite(items)
+        shutil.copy2(JSON_OLD_PATH, JSON_OLD_PATH.with_suffix(".json.migrated"))
+        logging.info("Migrated old JSON to SQLite")
+    except Exception as e:
+        logging.warning(f"Migration to SQLite failed: {e}")
+
+# run migration on startup
+migrate_json_to_backend()
 
 # -------------------------
 # ジオコーディング（成功時のみキャッシュ）
 # -------------------------
 GEO_CACHE = {}  # address -> (lat, lon, ts)
-
 def clear_geo_cache():
     GEO_CACHE.clear()
 
@@ -135,16 +273,16 @@ def _get_lat_lon_ai(address):
     if not address:
         return 0.0, 0.0
     try:
-        encoded_address = urllib.parse.quote(address)
-        url = f"https://msearch.gsi.go.jp/address-search/AddressSearch?q={encoded_address}"
+        encoded = urllib.parse.quote(address)
+        url = f"https://msearch.gsi.go.jp/address-search/AddressSearch?q={encoded}"
         req = urllib.request.Request(url, headers={'User-Agent': 'MoneyCollectionScheduler_v3'})
-        with urllib.request.urlopen(req, timeout=5) as response:
-            data = json.loads(response.read().decode('utf-8'))
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
             if data and len(data) > 0:
                 lon, lat = data[0]["geometry"]["coordinates"]
                 return float(lat), float(lon)
     except Exception as e:
-        logging.error(f"APIによる位置特定エラー: {e}")
+        logging.error(f"Geocode error: {e}")
     return 0.0, 0.0
 
 def get_lat_lon_ai_cached(address: str):
@@ -160,16 +298,13 @@ def get_lat_lon_ai_cached(address: str):
     return lat, lon
 
 # -------------------------
-# 距離計算
+# 距離とルール
 # -------------------------
 def calculate_geopy_distance(p1, p2):
     if p1 == (0.0, 0.0) or p2 == (0.0, 0.0):
         return UNK_DISTANCE
     return geopy.distance.geodesic(p1, p2).km
 
-# -------------------------
-# ルールチェックユーティリティ
-# -------------------------
 def check_date_rule(rule, day_num):
     if not rule or not rule.get("val"):
         return True
@@ -184,7 +319,7 @@ def check_date_rule(rule, day_num):
         elif rtype == "exact":
             return day_num == int(val)
     except Exception as e:
-        logging.warning(f"日付ルールパースエラー (ルールを適用せずスキップ): {e}")
+        logging.warning(f"Date rule parse error: {e}")
         return True
     return True
 
@@ -199,12 +334,11 @@ def check_interval_rule(task, day, history_days):
     return True
 
 # -------------------------
-# フォールバック選択ヘルパー（安全化）
+# フォールバック選択（安全）
 # -------------------------
 def choose_fallback_day(all_days, holiday_set, task, current_schedule=None, history_days=None):
     if not all_days:
         raise ValueError("all_days is empty")
-
     def is_same_loc_scheduled(day):
         if not current_schedule:
             return False
@@ -213,8 +347,6 @@ def choose_fallback_day(all_days, holiday_set, task, current_schedule=None, hist
             if t.get("loc_id") == task.get("loc_id"):
                 return True
         return False
-
-    # 1) 非休日・ルール合致・間隔OK・同日重複なし を満たす最初の日
     for day in all_days:
         day_str = day.strftime('%Y-%m-%d')
         if day_str in holiday_set:
@@ -231,8 +363,6 @@ def choose_fallback_day(all_days, holiday_set, task, current_schedule=None, hist
         if history_days is not None and not check_interval_rule(task, day, history_days):
             continue
         return day, False
-
-    # 2) 非休日かつ同日重複なし（日付ルールは緩める）
     for day in all_days:
         day_str = day.strftime('%Y-%m-%d')
         if day_str in holiday_set:
@@ -240,16 +370,14 @@ def choose_fallback_day(all_days, holiday_set, task, current_schedule=None, hist
         if is_same_loc_scheduled(day):
             continue
         return day, False
-
-    # 3) 本当に見つからなければ強制割当（最初の全日）
-    logging.warning(f"フォールバック: どのルールにも合致しないため強制割当 (loc_id={task.get('loc_id')}, step={task.get('step')})")
+    logging.warning(f"Fallback forced for loc_id={task.get('loc_id')}, step={task.get('step')}")
     return all_days[0], True
 
 # ==========================================
-# Streamlit UI
+# UI: Streamlit 本体
 # ==========================================
 st.set_page_config(page_title="集金スケジュール管理", layout="centered")
-st.title("💰 集金スケジュール管理 (改善版)")
+st.title("💰 集金スケジュール管理 (Supabase 永続化版)")
 
 # 初期化
 if "locations" not in st.session_state:
@@ -277,7 +405,10 @@ with tab_manage:
             clear_geo_cache()
             st.success("ジオコーディングキャッシュをクリアしました。")
     with colc2:
-        st.caption("住所→緯度経度は成功時のみキャッシュします。失敗（位置不明）はキャッシュされません。")
+        if SUPABASE:
+            st.caption("データは Supabase に保存されます。Streamlit Cloud の Secrets に SUPABASE_URL / SUPABASE_KEY を設定してください。")
+        else:
+            st.caption("Supabase 未設定のためローカル SQLite に保存します（locations.db）。")
 
     if not st.session_state.locations:
         st.info("現場が登録されていません。下のフォームから追加してください。")
@@ -331,7 +462,7 @@ with tab_manage:
 
     key_prefix = f"edit_{st.session_state.editing_id}" if st.session_state.editing_id is not None else "new_form"
 
-    # 住所入力をフォームの外で作成（on_change を使用）
+    # 住所入力（フォーム外で on_change）
     address = st.text_input(
         "🗺️ 現場住所（正しい住所を入れると距離を測ります）",
         value=current_data["address"] if current_data else "",
@@ -354,11 +485,10 @@ with tab_manage:
             form_lon = st.number_input("経度（0.0の場合は位置不明）",
                                        value=float(current_data["lon"]) if current_data else 0.0,
                                        format="%.6f", key=f"{key_prefix}_lon")
-        st.caption("※住所自動検索が失敗（0.0）した場合は、Googleマップ等で調べた緯度経度をここに入力してください。")
+        st.caption("※住所自動検索が失敗（0.0）した場合は手動で入力してください。")
 
         st.markdown("---")
         st.markdown("### 📅 各回収日の詳細ルール設定")
-
         existing_rules = {r["step"]: r for r in current_data.get("rules", [])} if current_data else {}
         rules = []
         type_options = ["特になし", "○日まで", "○日〜○日の間", "○日ぴったり"]
@@ -440,7 +570,7 @@ with tab_manage:
             st.session_state.editing_id = None
             st.rerun()
 
-# スケジュール生成タブ（前と同様のロジック。overflow のフォールバック呼び出しは choose_fallback_day(..., current_schedule=current_schedule, history_days=history_days) を使う）
+# スケジュール生成タブは先の改善版と同等（省略せず実装）
 with tab_schedule:
     st.subheader("📅 月間スケジュールの自動生成")
     now = datetime.today()
@@ -492,6 +622,7 @@ with tab_schedule:
             days_in_month = (end_date - start_date).days + 1
             all_days = [start_date + timedelta(days=x) for x in range(days_in_month)]
 
+            # タスクプールの作成
             task_pool = []
             for loc in st.session_state.locations:
                 for step_idx in range(loc["count"]):
@@ -610,12 +741,11 @@ with tab_schedule:
                     current_schedule[fd_str].append(forced_task)
                     history_days[task["loc_id"]].append({"step": task["step"], "day": fallback_day})
 
-            # ルートソート（Greedy）: first_task 抽出の安全化
+            # ルートソート（Greedy）: safe remove/pop
             for day_str in current_schedule:
                 if len(current_schedule[day_str]) > 1:
                     ordered_tasks = []
                     unvisited = current_schedule[day_str].copy()
-
                     first_task = None
                     for t in unvisited:
                         if t.get("lat", 0.0) != 0.0 and t.get("lon", 0.0) != 0.0:
@@ -625,10 +755,8 @@ with tab_schedule:
                         unvisited.remove(first_task)
                     else:
                         first_task = unvisited.pop(0)
-
                     current_loc = (first_task.get("lat", 0.0), first_task.get("lon", 0.0))
                     ordered_tasks.append(first_task)
-
                     while unvisited:
                         closest_idx = 0
                         min_d = float('inf')
@@ -640,25 +768,23 @@ with tab_schedule:
                             if d < min_d:
                                 min_d = d
                                 closest_idx = idx
-
                         next_task = unvisited.pop(closest_idx)
                         if next_task.get("lat", 0.0) != 0.0 and next_task.get("lon", 0.0) != 0.0:
                             current_loc = (next_task["lat"], next_task["lon"])
                         ordered_tasks.append(next_task)
-
                     current_schedule[day_str] = ordered_tasks
 
             st.session_state.schedule_results = {"calculated": True, "schedule": current_schedule}
 
     if st.session_state.schedule_results and st.session_state.schedule_results["calculated"]:
-        st.success("🗺️ 各現場のルート距離を計算し、最も効率の良いスケジュールを生成しました！")
+        st.success("🗺️ スケジュールを生成しました")
         for day_str, tasks in st.session_state.schedule_results["schedule"].items():
             if tasks:
                 date_obj = datetime.strptime(day_str, '%Y-%m-%d')
                 weekday_str = ["月", "火", "水", "木", "金", "土", "日"][date_obj.weekday()]
                 st.markdown(f"#### 📅 {day_str} ({weekday_str})  —  `{len(tasks)} 件`")
                 for idx, t in enumerate(tasks, 1):
-                    geo_alert = " ⚠️ *(位置不明のためルート末尾に配置)*" if t.get("lat", 0.0) == 0.0 else ""
-                    forced_alert = " 🔥 **(強制割当: 祝日/制約に合致せず割当)**" if t.get("forced_fallback") else ""
+                    geo_alert = " ⚠️ *(位置不明)*" if t.get("lat", 0.0) == 0.0 else ""
+                    forced_alert = " 🔥 **(強制割当)**" if t.get("forced_fallback") else ""
                     st.write(f"**{idx}.** 🏢 {t['company']} ： {t['name']} （{t['step']}回目）{geo_alert}{forced_alert}")
                 st.divider()
