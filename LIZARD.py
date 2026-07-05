@@ -1,10 +1,14 @@
-# app_improved.py
 """
-Supabase 永続化版（安全な upsert + SQLite フォールバック）完全版。
-- Supabase が利用可能なら優先して保存/読み込みする（upsert を用いる、安全対策あり）。
-- Supabase に失敗したらローカル SQLite にフォールバック。
-- 既存 locations_db.json があれば起動時に自動でマイグレーション（Supabase優先、失敗ならSQLite）。
-- フォームの lat/lon 初期化と address_changed の挙動改善。
+Final robust Streamlit app with Supabase persistence (safe upsert) and SQLite fallback.
+- Supabase preferred (upsert + non-destructive save). If Supabase unavailable or save fails, falls back to local SQLite.
+- Auto-migrate old locations_db.json -> Supabase (preferred) or SQLite.
+- Geocoding: success-only cache, address_changed clears stale coords and rejects very short inputs.
+- Form/session_state initialization to avoid stale coordinates.
+- Save operations show clear success/failure UI, and a JSON download backup is available.
+- Schedule generation logic preserved (greedy + fallback + route ordering).
+Notes:
+- On Streamlit Cloud: set SUPABASE_URL and SUPABASE_KEY in app secrets.
+- Make sure a Supabase table `locations(id integer primary key, data jsonb not null)` exists.
 """
 from __future__ import annotations
 import streamlit as st
@@ -22,16 +26,16 @@ from pathlib import Path
 import shutil
 import sqlite3
 
-# supabase client import (optional)
+# Optional Supabase client
 try:
     from supabase import create_client
 except Exception:
     create_client = None
 
-# ロギング
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# 定数 / パス
+# Paths / constants
 BASE_DIR = Path(__file__).resolve().parent
 JSON_OLD_PATH = BASE_DIR / "locations_db.json"
 SQLITE_DB = BASE_DIR / "locations.db"
@@ -44,7 +48,6 @@ UNK_DISTANCE = 999.0
 def get_supabase_client():
     if create_client is None:
         return None
-    # prefer st.secrets, then env
     url = None
     key = None
     try:
@@ -67,7 +70,7 @@ def get_supabase_client():
 SUPABASE = get_supabase_client()
 
 # -------------------------
-# ルール種別の正規化
+# Rule normalization
 # -------------------------
 def normalize_rule_type(user_label: str) -> str:
     if not user_label:
@@ -85,15 +88,17 @@ def denormalize_rule_type(internal_key: str) -> str:
     return inv.get(internal_key, "特になし")
 
 # -------------------------
-# SQLite helpers (init/load/save)
+# SQLite helpers
 # -------------------------
 def init_sqlite(db_path: Path):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS locations (
-                    id INTEGER PRIMARY KEY,
-                    data TEXT NOT NULL
-                   )""")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS locations (
+            id INTEGER PRIMARY KEY,
+            data TEXT NOT NULL
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -128,7 +133,7 @@ def load_data_sqlite(db_path: Path | None = None):
         logging.error(f"SQLite load error: {e}")
         return []
 
-def save_data_sqlite(locations: list, db_path: Path | None = None):
+def save_data_sqlite(locations: list, db_path: Path | None = None) -> bool:
     path = db_path or SQLITE_DB
     try:
         if path.exists():
@@ -146,7 +151,7 @@ def save_data_sqlite(locations: list, db_path: Path | None = None):
         conn.commit()
         conn.close()
         os.replace(tmp_db, path)
-        logging.info(f"Saved {len(locations)} to sqlite {path}")
+        logging.info(f"Saved {len(locations)} locations to sqlite {path}")
         return True
     except Exception as e:
         logging.error(f"SQLite save error: {e}")
@@ -160,15 +165,11 @@ def load_data_supabase():
         return None
     try:
         res = SUPABASE.table("locations").select("id,data").order("id", {"ascending": True}).execute()
-        data = getattr(res, "data", None)
-        if data is None:
-            # older client may return dict
-            data = res.get("data") if isinstance(res, dict) else None
+        data = getattr(res, "data", None) or (res.get("data") if isinstance(res, dict) else None)
         if not data:
             return []
         items = []
         for row in data:
-            # row may be {'id':..., 'data': {...}} or {'data': {...}}
             obj = row.get("data") if isinstance(row, dict) and "data" in row else row
             if isinstance(obj, str):
                 try:
@@ -190,10 +191,10 @@ def load_data_supabase():
         logging.error(f"Supabase load error: {e}")
         return None
 
-def save_data_supabase_safe(locations: list):
+def save_data_supabase_safe(locations: list) -> bool | None:
     """
-    Safe save: upsert (insert/update) then delete stale rows.
-    NEVER do global delete before insert to avoid data loss on partial failure.
+    Upsert then delete stale IDs. Return True on success, False on failure.
+    Do not perform destructive global delete before inserts.
     """
     if SUPABASE is None:
         return None
@@ -202,38 +203,35 @@ def save_data_supabase_safe(locations: list):
         res = SUPABASE.table("locations").select("id").execute()
         existing_rows = getattr(res, "data", None) or (res.get("data") if isinstance(res, dict) else None) or []
         existing_ids = {int(r["id"]) for r in existing_rows if isinstance(r, dict) and "id" in r}
-        # prepare new records
         to_upsert = []
         new_ids = set()
         for loc in locations:
             lid = int(loc.get("id", 0))
             new_ids.add(lid)
             to_upsert.append({"id": lid, "data": loc})
-        # upsert in chunks
         CHUNK = 100
         for i in range(0, len(to_upsert), CHUNK):
             chunk = to_upsert[i:i+CHUNK]
             try:
-                # use upsert if available
+                # prefer upsert
                 SUPABASE.table("locations").upsert(chunk).execute()
             except Exception:
-                # fallback to insert (may fail on conflict)
+                # fallback to insert (may error on conflict)
                 SUPABASE.table("locations").insert(chunk).execute()
-        # delete stale ids (those existing in DB but not in new_ids)
+        # delete stale
         ids_to_delete = list(existing_ids - new_ids)
         if ids_to_delete:
-            # delete in chunks
             for i in range(0, len(ids_to_delete), CHUNK):
                 chunk = ids_to_delete[i:i+CHUNK]
                 SUPABASE.table("locations").delete().in_("id", chunk).execute()
-        logging.info(f"Supabase safe save succeeded: upserted {len(to_upsert)}, deleted {len(ids_to_delete)}")
+        logging.info(f"Supabase safe save completed: upserted {len(to_upsert)}, deleted {len(ids_to_delete)}")
         return True
     except Exception as e:
-        logging.error(f"Supabase safe save error (no destructive op performed): {e}")
+        logging.error(f"Supabase safe save error: {e}")
         return False
 
 # -------------------------
-# High-level load/save: Supabase preferred, fallback to sqlite
+# High-level load/save
 # -------------------------
 def load_data():
     sup = load_data_supabase()
@@ -241,18 +239,17 @@ def load_data():
         return sup
     return load_data_sqlite()
 
-def save_data(locations=None):
+def save_data(locations: list | None = None) -> bool:
     locs = locations if locations is not None else getattr(st.session_state, "locations", [])
     if SUPABASE is not None:
         ok = save_data_supabase_safe(locs)
         if ok:
             return True
-        # if supabase save failed, fallback to sqlite
         logging.warning("Supabase save failed; falling back to SQLite")
     return save_data_sqlite(locs)
 
 # -------------------------
-# Auto-migrate JSON -> Supabase/SQLite (safe)
+# JSON -> backend migration
 # -------------------------
 def migrate_json_on_start():
     if not JSON_OLD_PATH.exists():
@@ -263,7 +260,6 @@ def migrate_json_on_start():
     except Exception as e:
         logging.warning(f"Failed to read old JSON: {e}")
         return
-    # try supabase first
     if SUPABASE is not None:
         try:
             to_upsert = [{"id": int(loc.get("id", 0)), "data": loc} for loc in items]
@@ -275,7 +271,6 @@ def migrate_json_on_start():
             return
         except Exception as e:
             logging.warning(f"Migration to Supabase failed: {e}")
-    # fallback sqlite
     try:
         save_data_sqlite(items)
         JSON_OLD_PATH.rename(JSON_OLD_PATH.with_suffix(".json.migrated"))
@@ -286,13 +281,14 @@ def migrate_json_on_start():
 migrate_json_on_start()
 
 # -------------------------
-# Geocoding cache and helpers
+# Geocoding
 # -------------------------
-GEO_CACHE = {}
+GEO_CACHE: dict = {}  # address -> (lat, lon, ts)
+
 def clear_geo_cache():
     GEO_CACHE.clear()
 
-def _get_lat_lon_ai(address: str):
+def _get_lat_lon_ai(address: str) -> tuple[float, float]:
     if not address:
         return 0.0, 0.0
     try:
@@ -305,30 +301,29 @@ def _get_lat_lon_ai(address: str):
                 lon, lat = data[0]["geometry"]["coordinates"]
                 return float(lat), float(lon)
     except Exception as e:
-        logging.error(f"Geocode error: {e}")
+        logging.debug(f"Geocode error: {e}")
     return 0.0, 0.0
 
-def get_lat_lon_ai_cached(address: str):
+def get_lat_lon_ai_cached(address: str) -> tuple[float, float]:
     if not address:
         return 0.0, 0.0
     cached = GEO_CACHE.get(address)
     if cached:
         return cached[0], cached[1]
     lat, lon = _get_lat_lon_ai(address)
-    # only cache successful results
     if lat != 0.0 or lon != 0.0:
         GEO_CACHE[address] = (lat, lon, time.time())
     return lat, lon
 
 # -------------------------
-# Distance / Rule helpers
+# Distance & rules
 # -------------------------
-def calculate_geopy_distance(p1, p2):
+def calculate_geopy_distance(p1, p2) -> float:
     if p1 == (0.0, 0.0) or p2 == (0.0, 0.0):
         return UNK_DISTANCE
     return geopy.distance.geodesic(p1, p2).km
 
-def check_date_rule(rule, day_num):
+def check_date_rule(rule, day_num) -> bool:
     if not rule or not rule.get("val"):
         return True
     rtype = normalize_rule_type(rule.get("type", "none"))
@@ -346,7 +341,7 @@ def check_date_rule(rule, day_num):
         return True
     return True
 
-def check_interval_rule(task, day, history_days):
+def check_interval_rule(task, day, history_days) -> bool:
     span_rule = next((span for span in task.get("intervals", []) if span["to"] == task["step"]), None)
     if span_rule:
         for hist in history_days.get(task["loc_id"], []):
@@ -357,7 +352,7 @@ def check_interval_rule(task, day, history_days):
     return True
 
 # -------------------------
-# Fallback selection (safe)
+# choose_fallback_day (safe)
 # -------------------------
 def choose_fallback_day(all_days, holiday_set, task, current_schedule=None, history_days=None):
     if not all_days:
@@ -386,7 +381,6 @@ def choose_fallback_day(all_days, holiday_set, task, current_schedule=None, hist
         if history_days is not None and not check_interval_rule(task, day, history_days):
             continue
         return day, False
-    # relax constraints
     for day in all_days:
         day_str = day.strftime("%Y-%m-%d")
         if day_str in holiday_set:
@@ -401,9 +395,9 @@ def choose_fallback_day(all_days, holiday_set, task, current_schedule=None, hist
 # Streamlit UI
 # ==========================================
 st.set_page_config(page_title="集金スケジュール管理", layout="centered")
-st.title("💰 集金スケジュール管理 (Supabase 永続化)")
+st.title("💰 集金スケジュール管理 (Supabase-safe)")
 
-# state init and load
+# load initial state
 if "locations" not in st.session_state:
     st.session_state.locations = load_data()
 if "editing_id" not in st.session_state:
@@ -411,21 +405,31 @@ if "editing_id" not in st.session_state:
 if "schedule_results" not in st.session_state:
     st.session_state.schedule_results = None
 
-def address_changed(key_prefix):
-    addr = st.session_state.get(f"{key_prefix}_address", "")
+def address_changed(key_prefix: str):
+    addr = st.session_state.get(f"{key_prefix}_address", "").strip()
+    # clear if empty
     if not addr:
         st.session_state[f"{key_prefix}_lat"] = 0.0
         st.session_state[f"{key_prefix}_lon"] = 0.0
+        st.session_state[f"{key_prefix}_geocoded"] = False
+        return
+    # reject very short inputs to avoid false matches
+    if len(addr) < 3:
+        st.session_state[f"{key_prefix}_lat"] = 0.0
+        st.session_state[f"{key_prefix}_lon"] = 0.0
+        st.session_state[f"{key_prefix}_geocoded"] = False
         return
     lat, lon = get_lat_lon_ai_cached(addr)
     if lat != 0.0 or lon != 0.0:
         st.session_state[f"{key_prefix}_lat"] = float(lat)
         st.session_state[f"{key_prefix}_lon"] = float(lon)
+        st.session_state[f"{key_prefix}_geocoded"] = True
     else:
-        # do not overwrite non-zero manual inputs; ensure zero-state remains zero
+        # clear stale values unless user manually filled non-zero
         if st.session_state.get(f"{key_prefix}_lat", 0.0) == 0.0 and st.session_state.get(f"{key_prefix}_lon", 0.0) == 0.0:
             st.session_state[f"{key_prefix}_lat"] = 0.0
             st.session_state[f"{key_prefix}_lon"] = 0.0
+        st.session_state[f"{key_prefix}_geocoded"] = False
 
 tab_manage, tab_schedule = st.tabs(["📋 現場管理", "📅 スケジュール生成"])
 
@@ -441,17 +445,25 @@ with tab_manage:
         else:
             st.caption("Supabase 未設定のためローカル SQLite に保存します（locations.db）。")
 
+    # Backup / download button
+    if st.button("📥 現在データをJSONでバックアップ"):
+        payload = json.dumps(st.session_state.locations, ensure_ascii=False, indent=2)
+        st.download_button("ダウンロード: locations_backup.json", payload, file_name="locations_backup.json", mime="application/json")
+
     if not st.session_state.locations:
         st.info("現場が登録されていません。下のフォームから追加してください。")
     else:
         st.subheader("🏢 登録済みの会社・現場一覧")
         df = pd.DataFrame(st.session_state.locations)
-        companies = df["company"].unique()
+        try:
+            companies = df["company"].unique()
+        except Exception:
+            companies = []
         for comp in companies:
             with st.expander(f"🏢 {comp}", expanded=True):
                 comp_locs = df[df["company"] == comp]
                 for _, row in comp_locs.iterrows():
-                    col_info, col_btn1, col_btn2 = st.columns([6, 2, 2])
+                    col_info, col_btn1, col_btn2 = st.columns([6,2,2])
                     with col_info:
                         has_gps = "📡 位置測定済" if row.get("lat", 0) != 0.0 else "⚠️ 住所不明"
                         st.markdown(f"**📍 {row['name']}** ({row['address']})")
@@ -462,22 +474,23 @@ with tab_manage:
                             st.rerun()
                     with col_btn2:
                         if st.button("削除", key=f"del_btn_{row['id']}"):
-                            if st.session_state.editing_id == row['id']:
-                                st.session_state.editing_id = None
-                            st.session_state.locations = [l for l in st.session_state.locations if l["id"] != row['id']]
-                            if save_data():
+                            # delete: perform safe save attempt without mutating existing state until success
+                            new_locations = [l for l in st.session_state.locations if l["id"] != row["id"]]
+                            ok = save_data(new_locations)
+                            if ok:
+                                st.session_state.locations = new_locations
                                 st.toast("🗑️ 現場を削除しました。")
                             else:
-                                st.error("削除の保存に失敗しました（保存先に問題があります）。")
+                                st.error("削除の保存に失敗しました。ネットワーク/保存先を確認してください。")
                             st.rerun()
 
     st.divider()
 
+    # Edit/new form
     current_data = None
     if st.session_state.editing_id is not None:
         found = [l for l in st.session_state.locations if l["id"] == st.session_state.editing_id]
         if found:
-            st.subheader("📝 現場の条件を編集")
             current_data = found[0]
         else:
             st.session_state.editing_id = None
@@ -489,20 +502,21 @@ with tab_manage:
     if "form_count" not in st.session_state or current_data:
         st.session_state.form_count = default_count
 
-    count = st.selectbox("🔄 月に行く合計回数を選んでください", list(range(1, 11)),
-                         index=int(st.session_state.form_count - 1), key="count_selector")
+    count = st.selectbox("🔄 月に行く合計回数を選んでください", list(range(1,11)),
+                        index=int(st.session_state.form_count - 1), key="count_selector")
     st.session_state.form_count = count
 
     key_prefix = f"edit_{st.session_state.editing_id}" if st.session_state.editing_id is not None else "new_form"
 
-    # initialize per-form session keys to avoid stale values
+    # initialize per-form session keys
     st.session_state.setdefault(f"{key_prefix}_address", current_data["address"] if current_data else "")
     st.session_state.setdefault(f"{key_prefix}_lat", float(current_data["lat"]) if current_data else 0.0)
     st.session_state.setdefault(f"{key_prefix}_lon", float(current_data["lon"]) if current_data else 0.0)
+    st.session_state.setdefault(f"{key_prefix}_geocoded", (st.session_state[f"{key_prefix}_lat"] != 0.0 or st.session_state[f"{key_prefix}_lon"] != 0.0))
 
-    # address input outside the form (allows on_change)
+    # address input outside form
     address = st.text_input(
-        "🗺️ 現場住所（正しい住所を入れると距離を測ります）",
+        "🗺️ 住所（正確な住所を入れると自動で緯度経度を取得）",
         value=st.session_state.get(f"{key_prefix}_address", ""),
         key=f"{key_prefix}_address",
         on_change=address_changed,
@@ -513,38 +527,33 @@ with tab_manage:
         company = st.text_input("🏢 会社名", value=current_data["company"] if current_data else "")
         name = st.text_input("📍 現場名", value=current_data["name"] if current_data else "", key=f"{key_prefix}_name")
 
-        st.markdown("##### 🌐 位置情報の微調整（通常は自動入力されます）")
+        st.markdown("##### 🌐 位置情報の微調整（自動入力後に必要ならここで編集）")
         col_lat, col_lon = st.columns(2)
         with col_lat:
-            form_lat = st.number_input("緯度（0.0の場合は位置不明）",
-                                       value=st.session_state.get(f"{key_prefix}_lat", 0.0),
-                                       format="%.6f", key=f"{key_prefix}_lat")
+            form_lat = st.number_input("緯度", value=st.session_state.get(f"{key_prefix}_lat", 0.0), format="%.6f", key=f"{key_prefix}_lat")
         with col_lon:
-            form_lon = st.number_input("経度（0.0の場合は位置不明）",
-                                       value=st.session_state.get(f"{key_prefix}_lon", 0.0),
-                                       format="%.6f", key=f"{key_prefix}_lon")
-        st.caption("※住所自動検索が失敗（0.0）した場合は手動で入力してください。")
+            form_lon = st.number_input("経度", value=st.session_state.get(f"{key_prefix}_lon", 0.0), format="%.6f", key=f"{key_prefix}_lon")
 
         st.markdown("---")
         st.markdown("### 📅 各回収日の詳細ルール設定")
         existing_rules = {r["step"]: r for r in current_data.get("rules", [])} if current_data else {}
         rules = []
-        type_options = ["特になし", "○日まで", "○日〜○日の間", "○日ぴったり"]
+        type_options = ["特になし","○日まで","○日〜○日の間","○日ぴったり"]
         for i in range(1, count):
             st.markdown(f"**【{i}回目の集金】**")
             saved_rule = existing_rules.get(i, {})
-            saved_type_label = denormalize_rule_type(normalize_rule_type(saved_rule.get("type", "none")))
+            saved_type_label = denormalize_rule_type(normalize_rule_type(saved_rule.get("type","none")))
             type_idx = type_options.index(saved_type_label) if saved_type_label in type_options else 0
             r_type = st.radio(f"{i}回目のルール選択", type_options, index=type_idx, key=f"{key_prefix}_type_{i}")
-            r_val = st.text_input(f"{i}回目の具体的な日付・期間 (例: 10、1-5)", value=saved_rule.get("val", ""), key=f"{key_prefix}_val_{i}")
+            r_val = st.text_input(f"{i}回目の具体的な日付・期間 (例: 10、1-5)", value=saved_rule.get("val",""), key=f"{key_prefix}_val_{i}")
             rules.append({"step": i, "type": normalize_rule_type(r_type), "val": r_val, "is_last": False})
 
-        st.markdown(f"**🏁【最終集金日（{count}回目）のルール】 ※必須事項**")
+        st.markdown(f"**🏁【最終集金日（{count}回目）】**")
         saved_last_rule = existing_rules.get(count, {})
-        saved_last_label = denormalize_rule_type(normalize_rule_type(saved_last_rule.get("type", "none")))
+        saved_last_label = denormalize_rule_type(normalize_rule_type(saved_last_rule.get("type","none")))
         last_type_idx = type_options.index(saved_last_label) if saved_last_label in type_options else 0
-        last_r_type = st.radio(f"最終集金のルール選択", type_options, index=last_type_idx, key=f"{key_prefix}_type_last")
-        last_r_val = st.text_input(f"最終集金の具体的な日付・期間 (例: 25、20-25)", value=saved_last_rule.get("val", ""), key=f"{key_prefix}_val_last")
+        last_r_type = st.radio("最終集金のルール選択", type_options, index=last_type_idx, key=f"{key_prefix}_type_last")
+        last_r_val = st.text_input("最終集金の具体的な日付・期間 (例: 25、20-25)", value=saved_last_rule.get("val",""), key=f"{key_prefix}_val_last")
         rules.append({"step": count, "type": normalize_rule_type(last_r_type), "val": last_r_val, "is_last": True})
 
         existing_intervals = {int(intv["from"]): intv["span"] for intv in current_data.get("intervals", [])} if current_data else {}
@@ -555,64 +564,236 @@ with tab_manage:
             for i in range(1, count):
                 next_label = f"{i+1}回目" if i+1 < count else "最終集金"
                 saved_span = existing_intervals.get(i, 0)
-                span = st.number_input(f"「{i}回目」と「{next_label}」の間隔は何日以上空けますか？", min_value=0, max_value=30, value=int(saved_span), key=f"{key_prefix}_span_{i}")
+                span = st.number_input(f"「{i}回目」と「{next_label}」の間隔（日）", min_value=0, max_value=365, value=int(saved_span), key=f"{key_prefix}_span_{i}")
                 intervals.append({"from": i, "to": i+1, "span": span})
 
         st.markdown("---")
         st.markdown("### 🗓️ 曜日・休日のルール")
-        sat = st.checkbox("土曜日も入れてよい", value=current_data.get("sat", True) if current_data else True, key=f"{key_prefix}_sat")
-        sun = st.checkbox("日曜日も入れてよい", value=current_data.get("sun", False) if current_data else False, key=f"{key_prefix}_sun")
+        sat = st.checkbox("土曜可", value=current_data.get("sat", True) if current_data else True, key=f"{key_prefix}_sat")
+        sun = st.checkbox("日曜可", value=current_data.get("sun", False) if current_data else False, key=f"{key_prefix}_sun")
 
-        submitted = st.form_submit_button("更新する" if st.session_state.editing_id is not None else "現場を登録する")
+        submitted = st.form_submit_button("保存")
 
         if submitted:
             address_val = st.session_state.get(f"{key_prefix}_address", "")
+            # ensure lat/lon come from session state (may have been updated by address_changed)
+            lat = st.session_state.get(f"{key_prefix}_lat", form_lat)
+            lon = st.session_state.get(f"{key_prefix}_lon", form_lon)
             if company and name and address_val:
-                if current_data and current_data["address"] == address_val:
-                    lat = st.session_state.get(f"{key_prefix}_lat", form_lat)
-                    lon = st.session_state.get(f"{key_prefix}_lon", form_lon)
-                else:
-                    with st.spinner("🌍 住所から正確な位置を測定中..."):
-                        lat, lon = get_lat_lon_ai_cached(address_val)
-                    if lat == 0.0 and lon == 0.0:
-                        # if user manually entered non-zero, keep it; else warn
-                        if st.session_state.get(f"{key_prefix}_lat", 0.0) != 0.0 or st.session_state.get(f"{key_prefix}_lon", 0.0) != 0.0:
-                            lat = st.session_state.get(f"{key_prefix}_lat", form_lat)
-                            lon = st.session_state.get(f"{key_prefix}_lon", form_lon)
-                        else:
-                            st.warning("⚠️ 住所の位置を自動特定できませんでした。位置を特定できないまま登録します。")
                 form_data = {
-                    "company": company, "name": name, "address": address_val, "count": count,
-                    "rules": rules, "intervals": intervals, "sat": sat, "sun": sun,
-                    "lat": float(lat), "lon": float(lon)
+                    "company": company, "name": name, "address": address_val,
+                    "count": count, "rules": rules, "intervals": intervals,
+                    "sat": sat, "sun": sun, "lat": float(lat), "lon": float(lon)
                 }
                 if st.session_state.editing_id is not None:
                     form_data["id"] = st.session_state.editing_id
-                    for idx, loc in enumerate(st.session_state.locations):
-                        if loc["id"] == st.session_state.editing_id:
-                            st.session_state.locations[idx] = form_data
-                            break
-                    st.session_state.editing_id = None
-                    st.success(f"✨ 「{name}」の情報を上書き更新しました！")
+                    # prepare new list and attempt save
+                    new_locations = [form_data if l["id"] == st.session_state.editing_id else l for l in st.session_state.locations]
+                    ok = save_data(new_locations)
+                    if ok:
+                        st.session_state.locations = new_locations
+                        st.success("更新を保存しました。")
+                        st.session_state.editing_id = None
+                        st.rerun()
+                    else:
+                        st.error("保存に失敗しました。バックアップして再試行してください。")
                 else:
                     current_ids = [loc["id"] for loc in st.session_state.locations]
-                    form_data["id"] = max(current_ids + [0]) + 1
-                    st.session_state.locations.append(form_data)
-                    st.success(f"🎉 新しい現場「{name}」を追加しました！")
-                if not save_data():
-                    st.error("保存に失敗しました。ネットワークまたは保存先の設定を確認してください。")
-                st.rerun()
+                    new_id = max(current_ids + [0]) + 1
+                    form_data["id"] = new_id
+                    new_locations = st.session_state.locations + [form_data]
+                    ok = save_data(new_locations)
+                    if ok:
+                        st.session_state.locations = new_locations
+                        st.success("新しい現場を追加しました。")
+                        st.rerun()
+                    else:
+                        st.error("保存に失敗しました。バックアップして再試行してください。")
             else:
-                st.error("会社名、現場名、住所は必須入力です。")
+                st.error("会社名、現場名、住所は必須です。")
 
-    if st.session_state.editing_id is not None:
-        if st.button("編集をキャンセル"):
-            st.session_state.editing_id = None
-            st.rerun()
-
-# Schedule tab (same logic, omitted for brevity in this message but included in the full file above)
 with tab_schedule:
-    st.subheader("📅 月間スケジュールの自動生成")
-    # (Full scheduling logic identical to previous stable implementation)
-    # ... (omitted here due to length; ensure you kept the earlier scheduling loop from the previous version)
-    st.info("スケジュール生成機能はこのアプリで動作します。")
+    st.subheader("📅 スケジュール生成")
+    now = datetime.today()
+    col_year, col_month = st.columns(2)
+    with col_year:
+        target_year = st.selectbox("年", [now.year-1, now.year, now.year+1], index=1)
+    with col_month:
+        target_month = st.selectbox("月", list(range(1,13)), index=now.month-1)
+
+    custom_holidays = st.date_input("除外する日（複数選択可）", value=[])
+    holiday_set = set()
+    if isinstance(custom_holidays, (list, tuple)):
+        holiday_set = {d.strftime("%Y-%m-%d") for d in custom_holidays if d}
+    elif hasattr(custom_holidays, "strftime"):
+        holiday_set = {custom_holidays.strftime("%Y-%m-%d")}
+
+    col_min, col_max = st.columns(2)
+    with col_min:
+        min_tasks = st.selectbox("最小件数", list(range(1,11)), index=1)
+    with col_max:
+        max_tasks = st.selectbox("最大件数", list(range(1,13)), index=4)
+
+    if st.button("🚀 スケジュールを生成"):
+        if not st.session_state.locations:
+            st.error("現場が登録されていません。")
+        else:
+            start_date = datetime(target_year, target_month, 1)
+            if target_month == 12:
+                end_date = datetime(target_year+1, 1, 1) - timedelta(days=1)
+            else:
+                end_date = datetime(target_year, target_month+1, 1) - timedelta(days=1)
+            days_in_month = (end_date - start_date).days + 1
+            all_days = [start_date + timedelta(days=x) for x in range(days_in_month)]
+
+            task_pool = []
+            for loc in st.session_state.locations:
+                for step_idx in range(loc["count"]):
+                    rules_list = loc.get("rules", [])
+                    rule = next((r for r in rules_list if r["step"] == step_idx+1), {"type":"none","val":""})
+                    priority = 0
+                    if rule["type"] in ["exact","range"]:
+                        priority += 20
+                    elif rule["type"] == "until":
+                        priority += 10
+                    if step_idx+1 == loc["count"]:
+                        priority += 5
+                    task_pool.append({
+                        "loc_id": loc["id"], "company": loc["company"], "name": loc["name"],
+                        "lat": loc.get("lat",0.0), "lon": loc.get("lon",0.0),
+                        "step": step_idx+1, "rule": rule, "priority": priority,
+                        "sat": loc.get("sat", True), "sun": loc.get("sun", False),
+                        "intervals": loc.get("intervals", [])
+                    })
+
+            current_schedule = {day.strftime("%Y-%m-%d"): [] for day in all_days}
+            unassigned_tasks = sorted(task_pool, key=lambda x: (-x["priority"], x["step"], x["loc_id"]))
+            history_days = {loc["id"]: [] for loc in st.session_state.locations}
+            overflow_tasks = []
+
+            for task in unassigned_tasks:
+                best_day = None
+                min_score = float("inf")
+                for day in all_days:
+                    day_str = day.strftime("%Y-%m-%d")
+                    d_num = day.day
+                    w = day.weekday()
+                    if day_str in holiday_set: continue
+                    if w == 5 and not task["sat"]: continue
+                    if w == 6 and not task["sun"]: continue
+                    if not check_date_rule(task["rule"], d_num): continue
+                    if len(current_schedule[day_str]) >= max_tasks: continue
+                    if not check_interval_rule(task, day, history_days): continue
+                    current_count = len(current_schedule[day_str])
+                    if current_schedule[day_str]:
+                        valid_last_loc = (0.0,0.0)
+                        for existing in reversed(current_schedule[day_str]):
+                            if existing.get("lat",0.0) != 0.0 and existing.get("lon",0.0) != 0.0:
+                                valid_last_loc = (existing["lat"], existing["lon"])
+                                break
+                        dist = calculate_geopy_distance(valid_last_loc, (task["lat"], task["lon"]))
+                    else:
+                        dist = 0.0
+                    score = current_count*5.0 + dist
+                    if score < min_score:
+                        min_score = score
+                        best_day = day
+                if best_day:
+                    best_day_str = best_day.strftime("%Y-%m-%d")
+                    current_schedule[best_day_str].append(task)
+                    history_days[task["loc_id"]].append({"step": task["step"], "day": best_day})
+                else:
+                    overflow_tasks.append(task)
+
+            # overflow reassign
+            for task in overflow_tasks:
+                best_day = None
+                min_score = float("inf")
+                for allowed_max in range(max_tasks, max_tasks+10):
+                    for day in all_days:
+                        day_str = day.strftime("%Y-%m-%d")
+                        d_num = day.day
+                        w = day.weekday()
+                        if day_str in holiday_set: continue
+                        if w == 5 and not task["sat"]: continue
+                        if w == 6 and not task["sun"]: continue
+                        if not check_date_rule(task["rule"], d_num): continue
+                        if not check_interval_rule(task, day, history_days): continue
+                        if len(current_schedule[day_str]) >= allowed_max: continue
+                        current_count = len(current_schedule[day_str])
+                        if current_schedule[day_str]:
+                            valid_last_loc = (0.0,0.0)
+                            for existing in reversed(current_schedule[day_str]):
+                                if existing.get("lat",0.0) != 0.0 and existing.get("lon",0.0) != 0.0:
+                                    valid_last_loc = (existing["lat"], existing["lon"])
+                                    break
+                            dist = calculate_geopy_distance(valid_last_loc, (task["lat"], task["lon"]))
+                        else:
+                            dist = 0.0
+                        score = current_count*5.0 + dist
+                        if score < min_score:
+                            min_score = score
+                            best_day = day
+                    if best_day:
+                        break
+                if best_day:
+                    best_day_str = best_day.strftime("%Y-%m-%d")
+                    current_schedule[best_day_str].append(task)
+                    history_days[task["loc_id"]].append({"step": task["step"], "day": best_day})
+                else:
+                    fallback_day, forced = choose_fallback_day(all_days, holiday_set, task, current_schedule=current_schedule, history_days=history_days)
+                    fd_str = fallback_day.strftime("%Y-%m-%d")
+                    forced_task = dict(task)
+                    forced_task["forced_fallback"] = forced
+                    current_schedule[fd_str].append(forced_task)
+                    history_days[task["loc_id"]].append({"step": task["step"], "day": fallback_day})
+
+            # route sort per day
+            for day_str in current_schedule:
+                if len(current_schedule[day_str]) > 1:
+                    ordered = []
+                    unvisited = current_schedule[day_str].copy()
+                    first_task = None
+                    for t in unvisited:
+                        if t.get("lat",0.0) != 0.0 and t.get("lon",0.0) != 0.0:
+                            first_task = t
+                            break
+                    if first_task:
+                        unvisited.remove(first_task)
+                    else:
+                        first_task = unvisited.pop(0)
+                    curr_loc = (first_task.get("lat",0.0), first_task.get("lon",0.0))
+                    ordered.append(first_task)
+                    while unvisited:
+                        closest_idx = 0
+                        min_d = float("inf")
+                        for idx, t in enumerate(unvisited):
+                            if t.get("lat",0.0) == 0.0 or t.get("lon",0.0) == 0.0:
+                                d = 9999.0
+                            else:
+                                d = calculate_geopy_distance(curr_loc, (t["lat"], t["lon"]))
+                            if d < min_d:
+                                min_d = d
+                                closest_idx = idx
+                        next_task = unvisited.pop(closest_idx)
+                        if next_task.get("lat",0.0) != 0.0 and next_task.get("lon",0.0) != 0.0:
+                            curr_loc = (next_task["lat"], next_task["lon"])
+                        ordered.append(next_task)
+                    current_schedule[day_str] = ordered
+
+            st.session_state.schedule_results = {"calculated": True, "schedule": current_schedule}
+
+    if st.session_state.schedule_results and st.session_state.schedule_results["calculated"]:
+        st.success("スケジュールを生成しました")
+        for day_str, tasks in st.session_state.schedule_results["schedule"].items():
+            if tasks:
+                date_obj = datetime.strptime(day_str, "%Y-%m-%d")
+                weekday_str = ["月","火","水","木","金","土","日"][date_obj.weekday()]
+                st.markdown(f"#### {day_str} ({weekday_str}) — `{len(tasks)} 件`")
+                for idx, t in enumerate(tasks, 1):
+                    geo_alert = " ⚠️(位置不明)" if t.get("lat",0.0) == 0.0 else ""
+                    forced_alert = " 🔥(強制割当)" if t.get("forced_fallback") else ""
+                    st.write(f"{idx}. {t['company']} : {t['name']} ({t['step']}回目){geo_alert}{forced_alert}")
+                st.divider()
+
+# End of file
