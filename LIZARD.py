@@ -4,31 +4,23 @@ import numpy as np
 import json
 import os
 from datetime import datetime, timedelta
+import urllib.parse
 import urllib.request
 
 # ==========================================
-# ⚙️ サーバーが寝ても絶対に消えない保存箱（修正版）
+# ⚙️ サーバーが寝ても絶対に消えない保存箱
 # ==========================================
-# サーバー内のファイルだとスリープ時に消えてしまうため、
-# Streamlitが用意している安全な「ブラウザ記憶（st.session_state）」をベースに管理します。
-# 完全に初期化された場合でもエラーが起きないようガードを徹底しました。
-
 if "locations" not in st.session_state:
     st.session_state.locations = []
 if "editing_id" not in st.session_state: st.session_state.editing_id = None
 if "last_input" not in st.session_state: st.session_state.last_input = None
 if "schedule_results" not in st.session_state: st.session_state.schedule_results = None
 
-# --- 🗺️ 本当に住所から位置（緯度経度）を測るAI機能 ---
+# --- 🗺️ 住所から位置（緯度経度）を測る機能 ---
 def get_lat_lon_ai(address):
-    """
-    国土地理院またはOpenStreetMapの無料APIを使って、住所から正確な緯度経度を自動で割り出します。
-    通信エラーや実在しない住所の場合は、安全のため(0.0, 0.0)を返します。
-    """
     if not address:
         return 0.0, 0.0
     try:
-        # 住所をURL用に変換
         encoded_address = urllib.parse.quote(address)
         url = f"https://msearch.gsi.go.jp/address-search/AddressSearch?q={encoded_address}"
         
@@ -36,7 +28,6 @@ def get_lat_lon_ai(address):
         with urllib.request.urlopen(req, timeout=5) as response:
             data = json.loads(response.read().decode('utf-8'))
             if data and len(data) > 0:
-                # 一番精度の高い最初の候補の緯度経度を取得
                 lon, lat = data[0]["geometry"]["coordinates"]
                 return float(lat), float(lon)
     except:
@@ -89,7 +80,6 @@ with tab_manage:
 
     st.divider()
     
-    # フォームのリセット・初期値制御
     current_data = None
     if st.session_state.editing_id is not None:
         found = [l for l in st.session_state.locations if l["id"] == st.session_state.editing_id]
@@ -102,8 +92,6 @@ with tab_manage:
     if current_data is None:
         st.subheader("➕ 新しい現場を追加")
 
-    # フォーム送信後にリセットをかけるためのkey設定用の仕組み
-    # 新規登録が成功するたびに、フォームのkeyを切り替えて文字を強制消去します
     if "form_version" not in st.session_state:
         st.session_state.form_version = 0
 
@@ -169,7 +157,6 @@ with tab_manage:
                     form_data["id"] = max([loc["id"] for loc in st.session_state.locations] + [0]) + 1
                     st.session_state.locations.append(form_data)
                     st.success(f"🎉 新しい現場「{name}」を追加しました！")
-                    # フォームのバージョンを上げて入力欄を完全リセット
                     st.session_state.form_version += 1
                 
                 st.session_state.last_input = form_data
@@ -183,7 +170,7 @@ with tab_manage:
             st.rerun()
 
 # ==========================================
-# 2. 📅 スケジュール生成タブ（距離AI計算版）
+# 2. 📅 スケジュール生成タブ（完全版・修正済）
 # ==========================================
 with tab_schedule:
     st.subheader("📅 月間スケジュールの自動生成")
@@ -229,60 +216,88 @@ with tab_schedule:
                         "sat": loc.get("sat", True), "sun": loc.get("sun", False)
                     })
             
-            # --- 🚀 距離を元にしたスマート並び替えAIロジック ---
+            # --- 🚀 距離＋ルールを考慮した生成ロジック ---
             current_schedule = {day.strftime('%Y-%m-%d'): [] for day in all_days}
-            unassigned_tasks = sorted(task_pool, key=lambda x: x['step'])
-            
+            unassigned_tasks = sorted(task_pool, key=lambda x: (x['step'], x['loc_id']))
+
+            # 最後に各現場を訪問した日を記録する辞書
+            last_visited_day = {loc["id"]: None for loc in st.session_state.locations}
+
+            # 前日の最終目的地を記憶する変数（最初は(0.0, 0.0)）
+            prev_day_last_loc = (0.0, 0.0)
+            last_active_day = None # 直前の稼働日を記録
+
             for day in all_days:
                 day_str = day.strftime('%Y-%m-%d')
                 d_num = day.day
                 w = day.weekday()
                 
-                # その日にまだ余裕がある間、最も「距離が近い」タスクを詰め込む
-                while len(current_schedule[day_str]) < max_tasks and unassigned_tasks:
+                # もし前回の稼働日から2日以上空いたら（土日を挟むなど）、スタート位置をリセット
+                if last_active_day is not None and (day - last_active_day).days > 1:
+                    prev_day_last_loc = (0.0, 0.0)
+                
+                while len(current_schedule[day_str]) < max_tasks:
                     best_task_idx = -1
                     min_dist = 999999.0
                     
-                    # 今日の最後の現場の位置（まだないなら0.0, 0.0）
+                    # 今日の直前の現場位置を取得
                     last_loc = (0.0, 0.0)
                     if current_schedule[day_str]:
                         last_loc = (current_schedule[day_str][-1]["lat"], current_schedule[day_str][-1]["lon"])
-                    
+                    else:
+                        # 今日の一件目なら、前日の最後の現場位置をベースにする
+                        last_loc = prev_day_last_loc
+                        
                     for idx, task in enumerate(unassigned_tasks):
-                        # 曜日制限チェック
+                        # 1. 曜日制限チェック
                         if w == 5 and not task["sat"]: continue
                         if w == 6 and not task["sun"]: continue
                         
-                        # ルールチェック
+                        # 2. 日付詳細ルールチェック（インデント修正済）
                         rule = next((r for r in task["rules"] if r["step"] == task["step"]), None)
                         if rule and rule.get("val"):
-                            if rule["type"] == "○日まで" and d_num > int(rule["val"]): continue
-                            if rule["type"] == "○日ぴったり" and d_num != int(rule["val"]): continue
-                            if rule["type"] == "○日〜○日の間":
-                                try:
+                            try:
+                                # 「○日〜○日の間」のチェック
+                                if rule["type"] == "○日〜○日の間":
                                     s, e = map(int, rule["val"].split('-'))
                                     if not (s <= d_num <= e): continue
-                                except: pass
+                                # 「○日まで」のチェック
+                                elif rule["type"] == "○日まで":
+                                    if d_num > int(rule["val"]): continue
+                                # 「○日ぴったり」のチェック
+                                elif rule["type"] == "○日ぴったり":
+                                    if d_num != int(rule["val"]): continue
+                            except (ValueError, TypeError):
+                                pass
                         
-                        # 今日の最後の現場からの距離を計測
+                        # 3. 間隔ルールチェック
+                        if task["step"] > 1:
+                            last_day = last_visited_day[task["loc_id"]]
+                            if last_day is not None:
+                                days_passed = (day - last_day).days
+                                loc_data = next(l for l in st.session_state.locations if l["id"] == task["loc_id"])
+                                span_rule = next((span for span in loc_data.get("intervals", []) if span["to"] == task["step"]), None)
+                                if span_rule and days_passed < span_rule["span"]:
+                                    continue
+                        
+                        # 4. 距離の計算
                         dist = calculate_distance(last_loc, (task["lat"], task["lon"]))
-                        
-                        # もし「同じ日」に同じ会社や近くの現場があるなら優先
-                        if last_loc != (0.0, 0.0) and dist < min_dist:
+                        if dist < min_dist:
                             min_dist = dist
                             best_task_idx = idx
-                        elif best_task_idx == -1:
-                            # 最初の候補
-                            min_dist = dist
-                            best_task_idx = idx
-                    
+                                
                     if best_task_idx != -1:
-                        # 最適な現場をその日に割り当て
-                        current_schedule[day_str].append(unassigned_tasks.pop(best_task_idx))
+                        chosen_task = unassigned_tasks.pop(best_task_idx)
+                        current_schedule[day_str].append(chosen_task)
+                        last_visited_day[chosen_task["loc_id"]] = day
+                        
+                        # 今日訪問した最後の現場位置を、前日位置として常に更新
+                        prev_day_last_loc = (chosen_task["lat"], chosen_task["lon"])
+                        last_active_day = day # 稼働日を更新
                     else:
-                        break # その日に回れる現場がもう条件的にない
+                        break # 条件に合う現場がもうない
             
-            # 残ってしまったタスクは安全に初日以降に分配
+            # --- 残った現場の安全分配処理 ---
             if unassigned_tasks:
                 for task in unassigned_tasks:
                     for day in all_days:
@@ -290,9 +305,11 @@ with tab_schedule:
                         if len(current_schedule[day_str]) < max_tasks:
                             current_schedule[day_str].append(task)
                             break
-            
+
+            # 結果をセッション状態に保存
             st.session_state.schedule_results = {"calculated": True, "schedule": current_schedule}
 
+    # スケジュール結果の表示（ボタンの外側）
     if st.session_state.schedule_results and st.session_state.schedule_results["calculated"]:
         st.success("🗺️ 各現場のルート距離を計算し、最も効率の良いスケジュールを生成しました！")
         for day_str, tasks in st.session_state.schedule_results["schedule"].items():
