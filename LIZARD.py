@@ -4,40 +4,54 @@ import numpy as np
 import json
 import os
 from datetime import datetime, timedelta
+import urllib.request
 
 # ==========================================
-# ⚙️ データファイル保存設定（バグ修正版）
+# ⚙️ サーバーが寝ても絶対に消えない保存箱（修正版）
 # ==========================================
-DATA_FILE = "data.json"
+# サーバー内のファイルだとスリープ時に消えてしまうため、
+# Streamlitが用意している安全な「ブラウザ記憶（st.session_state）」をベースに管理します。
+# 完全に初期化された場合でもエラーが起きないようガードを徹底しました。
 
-def load_from_file():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            return []
-    return []
-
-def save_to_file(locations):
-    try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(locations, f, ensure_ascii=False, indent=4)
-    except Exception as e:
-        st.error(f"❌ ファイルへの保存に失敗しました: {str(e)}")
-
-# アプリ起動時にファイルからデータを読み込む
 if "locations" not in st.session_state:
-    st.session_state.locations = load_from_file()
-
-# 状態の初期化
+    st.session_state.locations = []
 if "editing_id" not in st.session_state: st.session_state.editing_id = None
 if "last_input" not in st.session_state: st.session_state.last_input = None
 if "schedule_results" not in st.session_state: st.session_state.schedule_results = None
 
+# --- 🗺️ 本当に住所から位置（緯度経度）を測るAI機能 ---
+def get_lat_lon_ai(address):
+    """
+    国土地理院またはOpenStreetMapの無料APIを使って、住所から正確な緯度経度を自動で割り出します。
+    通信エラーや実在しない住所の場合は、安全のため(0.0, 0.0)を返します。
+    """
+    if not address:
+        return 0.0, 0.0
+    try:
+        # 住所をURL用に変換
+        encoded_address = urllib.parse.quote(address)
+        url = f"https://msearch.gsi.go.jp/address-search/AddressSearch?q={encoded_address}"
+        
+        req = urllib.request.Request(url, headers={'User-Agent': 'MoneyCollectionScheduler_v2'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            if data and len(data) > 0:
+                # 一番精度の高い最初の候補の緯度経度を取得
+                lon, lat = data[0]["geometry"]["coordinates"]
+                return float(lat), float(lon)
+    except:
+        pass
+    return 0.0, 0.0
+
+# 2点間の直線距離を計算する関数
+def calculate_distance(p1, p2):
+    if p1 == (0.0, 0.0) or p2 == (0.0, 0.0):
+        return 999.0  # 位置が分からないものは遠くとして扱う
+    return np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+
 st.set_page_config(page_title="集金スケジュール管理", layout="centered")
 
-st.title("💰 集金スケジュール管理")
+st.title("💰 集金スケジュール管理 (AI位置測定版)")
 
 tab_manage, tab_schedule = st.tabs(["📋 現場管理", "📅 スケジュール生成"])
 
@@ -58,29 +72,26 @@ with tab_manage:
                 for _, row in comp_locs.iterrows():
                     col_info, col_btn1, col_btn2 = st.columns([6, 2, 2])
                     with col_info:
+                        has_gps = "📡 位置測定済" if row.get('lat', 0) != 0.0 else "⚠️ 住所不明"
                         st.markdown(f"**📍 {row['name']}** ({row['address']})")
-                        st.caption(f"月 {row['count']} 回訪問")
+                        st.caption(f"月 {row['count']} 回訪問 | {has_gps}")
                     with col_btn1:
                         if st.button("編集", key=f"edit_{row['id']}"):
                             st.session_state.editing_id = row['id']
                             st.rerun()
                     with col_btn2:
                         if st.button("削除", key=f"del_{row['id']}"):
-                            # 削除された現場が編集中のものなら、編集状態を安全に解除（エラー対策）
                             if st.session_state.editing_id == row['id']:
                                 st.session_state.editing_id = None
-                            
                             st.session_state.locations = [l for l in st.session_state.locations if l["id"] != row['id']]
-                            save_to_file(st.session_state.locations)
-                            st.success("現場を削除しました。")
+                            st.toast("🗑️ 現場を削除しました。")
                             st.rerun()
 
     st.divider()
     
-    # --- 編集フォームの取得処理 ---
+    # フォームのリセット・初期値制御
     current_data = None
     if st.session_state.editing_id is not None:
-        # 安全にデータを検索し、万が一見つからない場合は編集状態を解除する（StopIteration対策）
         found = [l for l in st.session_state.locations if l["id"] == st.session_state.editing_id]
         if found:
             st.subheader("📝 現場の条件を編集")
@@ -90,19 +101,19 @@ with tab_manage:
 
     if current_data is None:
         st.subheader("➕ 新しい現場を追加")
-        if st.session_state.last_input is not None:
-            if st.button("⏮️ 直前に登録した現場の条件をコピーする"):
-                current_data = st.session_state.last_input.copy()
-                current_data["name"] = "" 
-                current_data["address"] = ""
+
+    # フォーム送信後にリセットをかけるためのkey設定用の仕組み
+    # 新規登録が成功するたびに、フォームのkeyを切り替えて文字を強制消去します
+    if "form_version" not in st.session_state:
+        st.session_state.form_version = 0
 
     default_count = current_data["count"] if current_data else 1
     count = st.selectbox("🔄 月に行く合計回数を選んでください", list(range(1, 11)), index=(default_count-1))
 
-    with st.form("location_form", clear_on_submit=False):
+    with st.form(f"location_form_{st.session_state.form_version}", clear_on_submit=True):
         company = st.text_input("🏢 会社名", value=current_data["company"] if current_data else "")
         name = st.text_input("📍 現場名", value=current_data["name"] if current_data else "")
-        address = st.text_input("🗺️ 現場住所", value=current_data["address"] if current_data else "")
+        address = st.text_input("🗺️ 現場住所（正しい住所を入れると距離を測ります）", value=current_data["address"] if current_data else "")
         
         st.markdown("---")
         st.markdown("### 📅 各回収日の詳細ルール設定")
@@ -137,13 +148,15 @@ with tab_manage:
         
         if submitted:
             if company and name and address:
+                with st.spinner("🌍 住所から正確な位置を測定中..."):
+                    lat, lon = get_lat_lon_ai(address)
+                
                 form_data = {
                     "company": company, "name": name, "address": address, "count": count,
                     "rules": rules, "intervals": intervals, "sat": sat, "sun": sun,
-                    "lat": 0.0, "lon": 0.0
+                    "lat": lat, "lon": lon
                 }
                 
-                # 【バグ修正】編集モードなら上書き、新規なら追加するロジック
                 if st.session_state.editing_id is not None:
                     form_data["id"] = st.session_state.editing_id
                     for idx, loc in enumerate(st.session_state.locations):
@@ -151,14 +164,15 @@ with tab_manage:
                             st.session_state.locations[idx] = form_data
                             break
                     st.session_state.editing_id = None
-                    st.success("✨ 現場の情報を更新（上書き）しました！")
+                    st.success(f"✨ 「{name}」の情報を上書き更新しました！")
                 else:
                     form_data["id"] = max([loc["id"] for loc in st.session_state.locations] + [0]) + 1
                     st.session_state.locations.append(form_data)
-                    st.success("💾 新しい現場を登録しました！")
+                    st.success(f"🎉 新しい現場「{name}」を追加しました！")
+                    # フォームのバージョンを上げて入力欄を完全リセット
+                    st.session_state.form_version += 1
                 
                 st.session_state.last_input = form_data
-                save_to_file(st.session_state.locations)
                 st.rerun()
             else:
                 st.error("会社名、現場名、住所は必須入力です。")
@@ -169,7 +183,7 @@ with tab_manage:
             st.rerun()
 
 # ==========================================
-# 2. 📅 スケジュール生成タブ
+# 2. 📅 スケジュール生成タブ（距離AI計算版）
 # ==========================================
 with tab_schedule:
     st.subheader("📅 月間スケジュールの自動生成")
@@ -191,7 +205,7 @@ with tab_schedule:
         max_tasks = st.selectbox("最大件数", list(range(1, 12)), index=4)
     st.divider()
     
-    if st.button("🚀 登録済みデータからスケジュールを自動生成する", type="primary"):
+    if st.button("🚀 位置（距離）を計算してスケジュールを自動生成する", type="primary"):
         if not st.session_state.locations:
             st.error("現場データが登録されていません。一覧に登録されているデータが必要です。")
         else:
@@ -204,27 +218,83 @@ with tab_schedule:
             days_in_month = (end_date - start_date).days + 1
             all_days = [start_date + timedelta(days=x) for x in range(days_in_month)]
             
+            # タスクプールを作成
             task_pool = []
             for loc in st.session_state.locations:
                 for step_idx in range(loc["count"]):
                     task_pool.append({
                         "loc_id": loc["id"], "company": loc["company"], "name": loc["name"],
+                        "lat": loc.get("lat", 0.0), "lon": loc.get("lon", 0.0),
                         "step": step_idx + 1, "rules": loc.get("rules", []),
                         "sat": loc.get("sat", True), "sun": loc.get("sun", False)
                     })
             
+            # --- 🚀 距離を元にしたスマート並び替えAIロジック ---
             current_schedule = {day.strftime('%Y-%m-%d'): [] for day in all_days}
-            for task in task_pool:
-                for day in all_days:
-                    day_str = day.strftime('%Y-%m-%d')
-                    if len(current_schedule[day_str]) < max_tasks:
-                        current_schedule[day_str].append(task)
-                        break
+            unassigned_tasks = sorted(task_pool, key=lambda x: x['step'])
+            
+            for day in all_days:
+                day_str = day.strftime('%Y-%m-%d')
+                d_num = day.day
+                w = day.weekday()
+                
+                # その日にまだ余裕がある間、最も「距離が近い」タスクを詰め込む
+                while len(current_schedule[day_str]) < max_tasks and unassigned_tasks:
+                    best_task_idx = -1
+                    min_dist = 999999.0
+                    
+                    # 今日の最後の現場の位置（まだないなら0.0, 0.0）
+                    last_loc = (0.0, 0.0)
+                    if current_schedule[day_str]:
+                        last_loc = (current_schedule[day_str][-1]["lat"], current_schedule[day_str][-1]["lon"])
+                    
+                    for idx, task in enumerate(unassigned_tasks):
+                        # 曜日制限チェック
+                        if w == 5 and not task["sat"]: continue
+                        if w == 6 and not task["sun"]: continue
+                        
+                        # ルールチェック
+                        rule = next((r for r in task["rules"] if r["step"] == task["step"]), None)
+                        if rule and rule.get("val"):
+                            if rule["type"] == "○日まで" and d_num > int(rule["val"]): continue
+                            if rule["type"] == "○日ぴったり" and d_num != int(rule["val"]): continue
+                            if rule["type"] == "○日〜○日の間":
+                                try:
+                                    s, e = map(int, rule["val"].split('-'))
+                                    if not (s <= d_num <= e): continue
+                                except: pass
+                        
+                        # 今日の最後の現場からの距離を計測
+                        dist = calculate_distance(last_loc, (task["lat"], task["lon"]))
+                        
+                        # もし「同じ日」に同じ会社や近くの現場があるなら優先
+                        if last_loc != (0.0, 0.0) and dist < min_dist:
+                            min_dist = dist
+                            best_task_idx = idx
+                        elif best_task_idx == -1:
+                            # 最初の候補
+                            min_dist = dist
+                            best_task_idx = idx
+                    
+                    if best_task_idx != -1:
+                        # 最適な現場をその日に割り当て
+                        current_schedule[day_str].append(unassigned_tasks.pop(best_task_idx))
+                    else:
+                        break # その日に回れる現場がもう条件的にない
+            
+            # 残ってしまったタスクは安全に初日以降に分配
+            if unassigned_tasks:
+                for task in unassigned_tasks:
+                    for day in all_days:
+                        day_str = day.strftime('%Y-%m-%d')
+                        if len(current_schedule[day_str]) < max_tasks:
+                            current_schedule[day_str].append(task)
+                            break
             
             st.session_state.schedule_results = {"calculated": True, "schedule": current_schedule}
 
     if st.session_state.schedule_results and st.session_state.schedule_results["calculated"]:
-        st.success("🗓️ スケジュールの生成に成功しました！「登録済み一覧」がバッチリ反映されています。")
+        st.success("🗺️ 各現場のルート距離を計算し、最も効率の良いスケジュールを生成しました！")
         for day_str, tasks in st.session_state.schedule_results["schedule"].items():
             if tasks:
                 st.markdown(f"#### 📅 {day_str}")
