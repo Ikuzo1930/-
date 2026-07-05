@@ -1,13 +1,12 @@
 """
-改良版 Streamlit アプリ
-- ルール種別を内部キーに正規化
-- save_data を原子的に置換
-- get_lat_lon_ai にキャッシュ
-- UNK_DISTANCE を定義
+改善版 Streamlit アプリ
+- GEO_CACHE: 成功時のみキャッシュ、キャッシュクリアボタン
+- フォールバックロジック: forced_fallback フラグを付与し UI で警告表示
+- save_data: 原子的な書き込み（tmp -> os.replace）
+- load_data: 既存データとの互換性のため rule.type を内部キーに正規化
 """
 import streamlit as st
 import pandas as pd
-import numpy as np
 import json
 import os
 import logging
@@ -15,8 +14,8 @@ from datetime import datetime, timedelta
 import urllib.parse
 import urllib.request
 import geopy.distance
-from functools import lru_cache
 import tempfile
+import time
 
 # ロギング
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -57,7 +56,6 @@ def load_data(db_file: str = None):
                 data = json.load(f)
             # 互換性のため、各レコードの rule.type を正規化しておく
             for loc in data:
-                # ensure fields exist and types normalized
                 loc.setdefault("rules", [])
                 loc.setdefault("intervals", [])
                 loc["lat"] = float(loc.get("lat", 0.0) or 0.0)
@@ -67,8 +65,12 @@ def load_data(db_file: str = None):
                     r["type"] = normalize_rule_type(r_type)
             return data
         except Exception as e:
-            st.error(f"データベースの読み込みに失敗しました: {e}")
+            # UI 層で st.error 可能だが CLI やテストからも使えるよう logging
             logging.error(f"DB load error: {e}")
+            try:
+                st.error(f"データベースの読み込みに失敗しました: {e}")
+            except Exception:
+                pass
             return []
     return []
 
@@ -83,20 +85,20 @@ def save_data(locations=None, db_file: str = None):
             json.dump(locs, f, ensure_ascii=False, indent=4)
         os.replace(tmp_path, path)
     except Exception as e:
-        # 注意: UIレイヤーでは st.error を出す。テストで呼ぶと streamlit がインポート済みなら st.error が動く。
+        logging.error(f"DB save error: {e}")
         try:
             st.error(f"データベースの保存に失敗しました: {e}")
         except Exception:
             pass
-        logging.error(f"DB save error: {e}")
 
 # -------------------------
-# ジオコーディング（キャッシュ）
+# ジオコーディング（成功時のみキャッシュ）
 # -------------------------
-@lru_cache(maxsize=1024)
-def get_lat_lon_ai_cached(address: str):
-    """アドレスに対する緯度経度をキャッシュするラッパー"""
-    return _get_lat_lon_ai(address)
+# シンプルな手動キャッシュ（TTLは将来付けられます）
+GEO_CACHE = {}  # address -> (lat, lon, ts)
+
+def clear_geo_cache():
+    GEO_CACHE.clear()
 
 def _get_lat_lon_ai(address):
     """国土地理院API を使って住所→(lat, lon) を返す。失敗時は (0.0,0.0)"""
@@ -114,6 +116,20 @@ def _get_lat_lon_ai(address):
     except Exception as e:
         logging.error(f"APIによる位置特定エラー: {e}")
     return 0.0, 0.0
+
+def get_lat_lon_ai_cached(address: str):
+    """成功時のみキャッシュするラッパー"""
+    if not address:
+        return 0.0, 0.0
+    cached = GEO_CACHE.get(address)
+    if cached:
+        lat, lon, ts = cached
+        return lat, lon
+    lat, lon = _get_lat_lon_ai(address)
+    # 成功時のみキャッシュする（lat,lon が両方 0.0 の場合はキャッシュしない）
+    if lat != 0.0 or lon != 0.0:
+        GEO_CACHE[address] = (lat, lon, time.time())
+    return lat, lon
 
 # -------------------------
 # 距離計算
@@ -157,8 +173,36 @@ def check_interval_rule(task, day, history_days):
                     return False
     return True
 
+# -------------------------
+# フォールバック選択ヘルパー
+# -------------------------
+def choose_fallback_day(all_days, holiday_set, task):
+    """フォールバック探索:
+       - まず非休日かつルールに合致する最初の日を探す
+       - 見つからなければ非休日を返す
+       - それでもなければ最終的に強制割当（all_days[0]）とし forced=True を返す
+    """
+    for day in all_days:
+        day_str = day.strftime('%Y-%m-%d')
+        if day_str in holiday_set:
+            continue
+        w = day.weekday()
+        if w == 5 and not task.get("sat", True):
+            continue
+        if w == 6 and not task.get("sun", False):
+            continue
+        if check_date_rule(task.get("rule", {}), day.day):
+            return day, False
+    # 非休日のどれかを返す（冗長ガード）
+    for day in all_days:
+        day_str = day.strftime('%Y-%m-%d')
+        if day_str not in holiday_set:
+            return day, False
+    # 本当に見つからない -> 強制割当
+    return all_days[0], True
+
 # ==========================================
-# Streamlit UI 本体（元のロジックを維持しつつ修正）
+# Streamlit UI 本体
 # ==========================================
 st.set_page_config(page_title="集金スケジュール管理", layout="centered")
 st.title("💰 集金スケジュール管理 (改善版)")
@@ -174,6 +218,15 @@ if "schedule_results" not in st.session_state:
 tab_manage, tab_schedule = st.tabs(["📋 現場管理", "📅 スケジュール生成"])
 
 with tab_manage:
+    # キャッシュクリアボタン（UI）
+    colc1, colc2 = st.columns([3, 7])
+    with colc1:
+        if st.button("位置キャッシュをクリアする"):
+            clear_geo_cache()
+            st.success("ジオコーディングキャッシュをクリアしました。")
+    with colc2:
+        st.caption("住所→緯度経度の成功時のみキャッシュします。失敗（位置不明）はキャッシュされません。")
+
     if not st.session_state.locations:
         st.info("現場が登録されていません。下のフォームから追加してください。")
     else:
@@ -248,7 +301,6 @@ with tab_manage:
 
         existing_rules = {}
         if current_data:
-            # 既に内部キーに正規化済みなのでそのまま使える
             existing_rules = {r["step"]: r for r in current_data.get("rules", [])}
 
         rules = []
@@ -256,13 +308,11 @@ with tab_manage:
         for i in range(1, count):
             st.markdown(f"**【{i}回目の集金】**")
             saved_rule = existing_rules.get(i, {})
-            # saved_rule["type"] は内部キーかもしれない -> denormalize 前に normalize してから denormalize
             saved_type_label = denormalize_rule_type(normalize_rule_type(saved_rule.get("type", "none")))
             type_idx = type_options.index(saved_type_label) if saved_type_label in type_options else 0
 
             r_type = st.radio(f"{i}回目のルール選択", type_options, index=type_idx, key=f"{key_prefix}_type_{i}")
             r_val = st.text_input(f"{i}回目の具体的な日付・期間 (例: 10、1-5)", value=saved_rule.get("val", ""), key=f"{key_prefix}_val_{i}")
-            # 保存は内部キー化
             rules.append({"step": i, "type": normalize_rule_type(r_type), "val": r_val, "is_last": False})
 
         st.markdown(f"**🏁【最終集金日（{count}回目）のルール】 ※必須事項**")
@@ -295,7 +345,6 @@ with tab_manage:
 
         if submitted:
             if company and name and address:
-                # 住所が変わったら API で再取得。キャッシュラッパーを使用
                 if current_data and current_data["address"] == address:
                     lat, lon = form_lat, form_lon
                 else:
@@ -501,27 +550,13 @@ with tab_schedule:
                     current_schedule[best_day_str].append(task)
                     history_days[task["loc_id"]].append({"step": task["step"], "day": best_day})
                 else:
-                    # フォールバック
-                    fallback_day = None
-                    for day in all_days:
-                        day_str = day.strftime('%Y-%m-%d')
-                        if day_str in holiday_set: continue
-                        w = day.weekday()
-                        if w == 5 and not task["sat"]: continue
-                        if w == 6 and not task["sun"]: continue
-                        if check_date_rule(task["rule"], day.day):
-                            fallback_day = day
-                            break
-
-                    if not fallback_day:
-                        for day in all_days:
-                            if day.strftime('%Y-%m-%d') not in holiday_set:
-                                fallback_day = day
-                                break
-                        if not fallback_day:
-                            fallback_day = all_days[0]
-
-                    current_schedule[fallback_day.strftime('%Y-%m-%d')].append(task)
+                    # フォールバック（強制割当フラグを付与）
+                    fallback_day, forced = choose_fallback_day(all_days, holiday_set, task)
+                    fd_str = fallback_day.strftime('%Y-%m-%d')
+                    # タスクに forced_fallback フラグを付けて保存
+                    forced_task = dict(task)
+                    forced_task["forced_fallback"] = forced
+                    current_schedule[fd_str].append(forced_task)
                     history_days[task["loc_id"]].append({"step": task["step"], "day": fallback_day})
 
             # ルートソート（Greedy）
@@ -573,6 +608,7 @@ with tab_schedule:
 
                 st.markdown(f"#### 📅 {day_str} ({weekday_str})  —  `{len(tasks)} 件`")
                 for idx, t in enumerate(tasks, 1):
-                    geo_alert = " ⚠️ *(位置不明のためルート末尾に配置)*" if t["lat"] == 0.0 else ""
-                    st.write(f"**{idx}.** 🏢 {t['company']} ： {t['name']} （{t['step']}回目）{geo_alert}")
+                    geo_alert = " ⚠️ *(位置不明のためルート末尾に配置)*" if t.get("lat", 0.0) == 0.0 else ""
+                    forced_alert = " 🔥 **(強制割当: 祝日/制約に合致せず割当)**" if t.get("forced_fallback") else ""
+                    st.write(f"**{idx}.** 🏢 {t['company']} ： {t['name']} （{t['step']}回目）{geo_alert}{forced_alert}")
                 st.divider()
