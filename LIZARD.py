@@ -1,3 +1,4 @@
+# app_improved.py
 """
 完全版: Streamlit アプリ（改善済み）
 - 住所入力をフォーム外に移動して on_change を使用
@@ -6,6 +7,7 @@
 - choose_fallback_day: current_schedule/history_days を考慮して安全化
 - forced_fallback フラグの付与と UI 表示
 - ルートソートの安全化
+- フォーム内に現場名 (name) 入力欄を確実に配置（NameError 対策）
 """
 import streamlit as st
 import pandas as pd
@@ -304,7 +306,9 @@ with tab_manage:
 
     with st.form(f"location_form_{st.session_state.editing_id}", clear_on_submit=False):
         company = st.text_input("🏢 会社名", value=current_data["company"] if current_data else "")
-        # 緯度/経度はフォーム内だが on_change は使っていない（address_changed で更新）
+        # ← ここに現場名欄を必ず置く（NameError の原因を解消）
+        name = st.text_input("📍 現場名", value=current_data["name"] if current_data else "", key=f"{key_prefix}_name")
+
         st.markdown("##### 🌐 位置情報の微調整（通常は自動入力されます）")
         col_lat, col_lon = st.columns(2)
         with col_lat:
