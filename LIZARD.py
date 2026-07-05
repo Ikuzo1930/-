@@ -6,6 +6,7 @@ import os
 from datetime import datetime, timedelta
 import urllib.parse
 import urllib.request
+import geopy.distance  # 👈 トップレベル、またはここで必ずインポート
 
 # ==========================================
 # ⚙️ サーバーが寝ても絶対に消えない保存箱
@@ -170,7 +171,7 @@ with tab_manage:
             st.rerun()
 
 # ==========================================
-# 2. 📅 スケジュール生成タブ（完全版・修正済）
+# 2. 📅 スケジュール生成タブ（大量現場・最適化版）
 # ==========================================
 with tab_schedule:
     st.subheader("📅 月間スケジュールの自動生成")
@@ -216,23 +217,27 @@ with tab_schedule:
                         "sat": loc.get("sat", True), "sun": loc.get("sun", False)
                     })
             
-            # --- 🚀 距離＋ルールを考慮した生成ロジック ---
+            # --- 新・距離計算関数（geopy版） ---
+            def calculate_geopy_distance(p1, p2):
+                if p1 == (0.0, 0.0) or p2 == (0.0, 0.0):
+                    return 999.0
+                return geopy.distance.geodesic(p1, p2).km
+
             current_schedule = {day.strftime('%Y-%m-%d'): [] for day in all_days}
+            
+            # 【最善策】大量の現場を捌くため、条件の厳しいタスク（ステップ順、かつ制約が多いもの）を優先するベースを作る
             unassigned_tasks = sorted(task_pool, key=lambda x: (x['step'], x['loc_id']))
 
-            # 最後に各現場を訪問した日を記録する辞書
             last_visited_day = {loc["id"]: None for loc in st.session_state.locations}
-
-            # 前日の最終目的地を記憶する変数（最初は(0.0, 0.0)）
             prev_day_last_loc = (0.0, 0.0)
-            last_active_day = None # 直前の稼働日を記録
+            last_active_day = None
 
+            # --- メインループ ---
             for day in all_days:
                 day_str = day.strftime('%Y-%m-%d')
                 d_num = day.day
                 w = day.weekday()
                 
-                # もし前回の稼働日から2日以上空いたら（土日を挟むなど）、スタート位置をリセット
                 if last_active_day is not None and (day - last_active_day).days > 1:
                     prev_day_last_loc = (0.0, 0.0)
                 
@@ -240,37 +245,31 @@ with tab_schedule:
                     best_task_idx = -1
                     min_dist = 999999.0
                     
-                    # 今日の直前の現場位置を取得
                     last_loc = (0.0, 0.0)
                     if current_schedule[day_str]:
                         last_loc = (current_schedule[day_str][-1]["lat"], current_schedule[day_str][-1]["lon"])
                     else:
-                        # 今日の一件目なら、前日の最後の現場位置をベースにする
                         last_loc = prev_day_last_loc
                         
                     for idx, task in enumerate(unassigned_tasks):
-                        # 1. 曜日制限チェック
+                        # 1. 曜日制限
                         if w == 5 and not task["sat"]: continue
                         if w == 6 and not task["sun"]: continue
                         
-                        # 2. 日付詳細ルールチェック（インデント修正済）
+                        # 2. 日付詳細ルール
                         rule = next((r for r in task["rules"] if r["step"] == task["step"]), None)
                         if rule and rule.get("val"):
                             try:
-                                # 「○日〜○日の間」のチェック
                                 if rule["type"] == "○日〜○日の間":
                                     s, e = map(int, rule["val"].split('-'))
                                     if not (s <= d_num <= e): continue
-                                # 「○日まで」のチェック
                                 elif rule["type"] == "○日まで":
                                     if d_num > int(rule["val"]): continue
-                                # 「○日ぴったり」のチェック
                                 elif rule["type"] == "○日ぴったり":
                                     if d_num != int(rule["val"]): continue
-                            except (ValueError, TypeError):
-                                pass
+                            except: pass
                         
-                        # 3. 間隔ルールチェック
+                        # 3. 間隔ルール
                         if task["step"] > 1:
                             last_day = last_visited_day[task["loc_id"]]
                             if last_day is not None:
@@ -280,8 +279,8 @@ with tab_schedule:
                                 if span_rule and days_passed < span_rule["span"]:
                                     continue
                         
-                        # 4. 距離の計算
-                        dist = calculate_distance(last_loc, (task["lat"], task["lon"]))
+                        # 4. 距離の計算（geopyを適用）
+                        dist = calculate_geopy_distance(last_loc, (task["lat"], task["lon"]))
                         if dist < min_dist:
                             min_dist = dist
                             best_task_idx = idx
@@ -291,22 +290,40 @@ with tab_schedule:
                         current_schedule[day_str].append(chosen_task)
                         last_visited_day[chosen_task["loc_id"]] = day
                         
-                        # 今日訪問した最後の現場位置を、前日位置として常に更新
                         prev_day_last_loc = (chosen_task["lat"], chosen_task["lon"])
-                        last_active_day = day # 稼働日を更新
+                        last_active_day = day
                     else:
-                        break # 条件に合う現場がもうない
-            
-            # --- 残った現場の安全分配処理 ---
-            if unassigned_tasks:
-                for task in unassigned_tasks:
-                    for day in all_days:
-                        day_str = day.strftime('%Y-%m-%d')
-                        if len(current_schedule[day_str]) < max_tasks:
-                            current_schedule[day_str].append(task)
-                            break
+                        break
 
-            # 結果をセッション状態に保存
+            # --- 🛠️ 【超重要】溢れた大量タスクの「スマート近隣分配」処理 ---
+            if unassigned_tasks:
+                # 残ってしまったタスクを1つずつループ
+                for task in unassigned_tasks:
+                    best_day_str = None
+                    min_overflow_dist = 999999.0
+                    
+                    # カレンダー全日程をスキャンして、「最も距離が近くなる日」を探す
+                    for day in all_days:
+                        target_day_str = day.strftime('%Y-%m-%d')
+                        
+                        # 1日の最大件数を超えていない日だけが対象
+                        if len(current_schedule[target_day_str]) < max_tasks:
+                            # その日の最後の現場、もしくは最初の現場との距離を測る
+                            if current_schedule[target_day_str]:
+                                compare_loc = (current_schedule[target_day_str][-1]["lat"], current_schedule[target_day_str][-1]["lon"])
+                            else:
+                                compare_loc = (0.0, 0.0)
+                            
+                            dist = calculate_geopy_distance(compare_loc, (task["lat"], task["lon"]))
+                            if dist < min_overflow_dist:
+                                min_overflow_dist = dist
+                                best_day_str = target_day_str
+                    
+                    # 最もルートが効率的になる日にねじ込む
+                    if best_day_str:
+                        current_schedule[best_day_str].append(task)
+
+            st.session_state.locations_count = len(st.session_state.locations)
             st.session_state.schedule_results = {"calculated": True, "schedule": current_schedule}
 
     # スケジュール結果の表示（ボタンの外側）
@@ -314,6 +331,6 @@ with tab_schedule:
         st.success("🗺️ 各現場のルート距離を計算し、最も効率の良いスケジュールを生成しました！")
         for day_str, tasks in st.session_state.schedule_results["schedule"].items():
             if tasks:
-                st.markdown(f"#### 📅 {day_str}")
+                st.markdown(f"#### 📅 {day_str} ({len(tasks)} 件)")
                 for t in tasks:
                     st.write(f"- 🏢 {t['company']} ： {t['name']} （{t['step']}回目）")
